@@ -89,8 +89,8 @@ Or edit `DEFAULT_SERVER_EXE` in `llama_server.py`.
 ### 4. Place a GGUF model
 
 Drop any GGUF model at `./models/model.gguf` (overridable via
-`LLAMA_MODEL_PATH`). Tested with **Qwen3-1.7B Q5_K_M** (~1.2 GB).
-Other supported architectures: Llama 3, Mistral, Gemma, Phi, Qwen2.5, etc.
+`LLAMA_MODEL_PATH`). Any architecture supported by your `llama-server.exe`
+build will work — pick a quantization that fits your VRAM.
 
 ### 5. (One-time) Index a PDF
 
