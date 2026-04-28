@@ -3,8 +3,8 @@
 A fully offline, GPU-accelerated, stateful RAG assistant for PDFs. Parses
 documents with **IBM Docling** (preserves tables, code, math), embeds with
 **sentence-transformers**, persists in **ChromaDB**, and answers via a local
-**llama.cpp** server (Qwen3 / any GGUF). Streamlit UI on top, Ragas evaluation
-on the side. No cloud, no API keys.
+**llama.cpp** server with any GGUF model. Streamlit UI on top, Ragas
+evaluation on the side. No cloud, no API keys.
 
 ## Architecture
 
@@ -53,7 +53,8 @@ The chain has two paths:
   transitive dependency of Docling)
 - **NVIDIA GPU** with recent driver (CUDA 12.x or newer). CPU also works,
   just slower — set `n_gpu_layers=0` in `LLMConfig`.
-- ~4 GB free VRAM for a 1.7B Q5 model + 32K context
+- Free VRAM matched to your model + KV cache. The defaults assume a
+  ~4 GB card; bigger models or longer context need more.
 
 ## Setup
 
@@ -159,20 +160,20 @@ Default metrics: `context_precision` + `faithfulness` + `answer_relevancy`.
 ## Notes on the design choices
 
 **Why a subprocess server instead of `llama-cpp-python`?** On Windows, the
-prebuilt CUDA wheels for `llama-cpp-python` are stuck at v0.3.4 (Nov 2024),
-whose bundled llama.cpp does not understand the `qwen3` GGUF architecture
-(added upstream Apr 2025). Building from source needs MSVC + CUDA toolkit.
-Using the standalone `llama-server.exe` from upstream releases sidesteps all
-of this and gives you the latest model support for free.
+prebuilt CUDA wheels for `llama-cpp-python` lag the upstream `llama.cpp`
+release cadence by months, so newer GGUF architectures often fail to load.
+Building from source needs MSVC + CUDA toolkit. Using the standalone
+`llama-server.exe` from upstream releases sidesteps all of this and gives
+you the latest model support for free.
 
 **Why HybridChunker?** Docling's `HierarchicalChunker` produces lots of tiny
 single-sentence chunks (e.g. just a section header). `HybridChunker` merges
 adjacent peers up to a token budget, so each chunk carries enough context
 for high-precision retrieval.
 
-**Defensive standalone-query rewrite.** Small reasoning models (Qwen3 1.7B)
-sometimes regurgitate prior conversation turns into the rewritten query, or
-emit SQL, or get truncated mid-`<think>`. The chain detects these failure
+**Defensive standalone-query rewrite.** Small reasoning models sometimes
+regurgitate prior conversation turns into the rewritten query, or emit
+SQL, or get truncated mid-`<think>`. The chain detects these failure
 modes (length heuristic + `<think>` stripping) and falls back to the raw
 user question.
 

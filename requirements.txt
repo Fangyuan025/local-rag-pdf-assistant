@@ -1,23 +1,23 @@
 # --- Document Parsing ---
+# Docling does layout-aware PDF -> Markdown conversion (preserves tables,
+# code, formulas-as-LaTeX). Pulls in PyTorch + transformers transitively
+# for its layout / table-detection models.
 docling>=2.0.0
 
 # --- Local LLM Engine ---
-# Pinned to 0.3.19 because that is the latest version with a prebuilt
-# Windows + Python 3.12 wheel in abetlen's index. Install with:
-#   CPU:    pip install "llama-cpp-python==0.3.19" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu --only-binary=:all:
-#   CUDA:   pip install "llama-cpp-python==0.3.19" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 --only-binary=:all:
-llama-cpp-python==0.3.19
+# We talk to a standalone llama-server.exe over HTTP, NOT via Python
+# bindings. So no llama-cpp-python in this list. See README step 3 for the
+# binary download. ChatOpenAI (langchain-openai) is the HTTP client.
 
 # --- Embeddings & Vector Store ---
 sentence-transformers>=2.7.0
 chromadb>=0.5.0
 
 # --- Orchestration ---
-langchain>=0.3.0
-langchain-community>=0.3.0
 langchain-core>=0.3.0
 langchain-chroma>=0.1.4
 langchain-huggingface>=0.1.0
+langchain-openai>=0.2.0      # ChatOpenAI client pointed at llama-server
 
 # --- Evaluation (Offline) ---
 ragas>=0.2.0
@@ -28,5 +28,5 @@ streamlit>=1.36.0
 
 # --- Utilities ---
 pydantic>=2.7.0
-python-dotenv>=1.0.1
 pandas>=2.2.0
+requests>=2.31.0             # used by llama_server.py for /health probe
