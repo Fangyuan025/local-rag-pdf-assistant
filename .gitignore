@@ -1,0 +1,22 @@
+# Local data + artifacts
+chroma_db/
+data/uploads/
+eval_results/
+models/*.gguf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Runtime logs
+*.log
+

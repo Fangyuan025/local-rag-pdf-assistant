@@ -1,0 +1,517 @@
+"""
+Step 3: Local LLM Engine, Conversational Memory, and RAG Chain.
+
+- Loads a local GGUF model via llama-cpp-python (no network calls).
+- Maintains chat history with LangChain's RunnableWithMessageHistory.
+- Implements a "Standalone Query Generator" that rewrites the latest user
+  question into a context-independent search query using the chat history.
+- Retrieves relevant chunks from the local Chroma store and grounds the
+  final answer on them.
+"""
+from __future__ import annotations
+
+import os
+# llama-cpp-python and PyTorch (via sentence-transformers) both ship their own
+# OpenMP runtimes on Windows. Loading both into one process triggers a duplicate
+# OpenMP runtime check that segfaults. This flag tells Intel OpenMP to tolerate
+# it. MUST be set BEFORE numpy/torch/llama_cpp are imported.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import logging
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from langchain_openai import ChatOpenAI
+from langchain_core.chat_history import BaseChatMessageHistory, InMemoryChatMessageHistory
+from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.runnables import (
+    Runnable,
+    RunnableLambda,
+    RunnablePassthrough,
+)
+from langchain_core.runnables.history import RunnableWithMessageHistory
+
+from vector_store import LocalVectorStore, build_default_store
+from llama_server import (
+    LlamaServer,
+    ServerConfig,
+    get_shared_server,
+    DEFAULT_MODEL_PATH as SERVER_DEFAULT_MODEL_PATH,
+)
+
+logger = logging.getLogger("llm_chain")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+DEFAULT_MODEL_PATH = SERVER_DEFAULT_MODEL_PATH
+
+
+@dataclass
+class LLMConfig:
+    model_path: Path = DEFAULT_MODEL_PATH
+    # Qwen3 1.7B supports up to 40K. n_ctx is TOTAL across llama-server
+    # slots; per-slot ctx = n_ctx / parallel. With server parallel=4 the
+    # 32768 here gives 8192 per slot, plenty for ragas judge prompts.
+    # KV cache lives on the GPU; on a 4GB card the model + 32K KV ≈ 2-3GB.
+    n_ctx: int = 32768
+    # -1 = offload ALL layers to GPU (requires CUDA-enabled llama-server).
+    # Set to 0 for CPU-only.
+    n_gpu_layers: int = -1
+    temperature: float = 0.2
+    # Generous so answers + ragas judge JSON don't get truncated.
+    max_tokens: int = 2048
+    top_p: float = 0.95
+    repeat_penalty: float = 1.1
+    # llama-server HTTP endpoint config (port etc.) is in ServerConfig.
+    server_config: Optional[ServerConfig] = None
+    extra_kwargs: dict = field(default_factory=dict)
+
+
+# Qwen3 chat-template directive that disables the <think> reasoning block.
+# Append this to a user message and the model will answer directly.
+# Reference: Qwen3 uses /think and /no_think soft switches in the prompt.
+QWEN3_NO_THINK = "/no_think"
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+# Putting /no_think at the very START of the system message is the most
+# reliable way to disable Qwen3's <think> block - putting it inside or at
+# the end of the user message can cause the model to echo it back as content.
+CONDENSE_QUESTION_SYSTEM = (
+    QWEN3_NO_THINK + "\n"
+    "You rewrite a user's latest message into a single, fully self-contained "
+    "search query for a document database. Resolve every pronoun and implicit "
+    "reference using the chat history. Return ONLY the rewritten query - no "
+    "preamble, no quotes, no explanation, no slashes, no special tokens. "
+    "If the latest message is already self-contained, return it UNCHANGED."
+)
+
+CONDENSE_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", CONDENSE_QUESTION_SYSTEM),
+        MessagesPlaceholder("chat_history"),
+        ("human", "Latest message: {question}\n\nStandalone search query:"),
+    ]
+)
+
+ANSWER_SYSTEM = (
+    QWEN3_NO_THINK + "\n"
+    "You are a precise assistant answering questions strictly from the "
+    "provided PDF context. Follow these rules:\n"
+    "1. Use ONLY the facts contained in the context below. If the answer "
+    "   is not present in the context, reply exactly: "
+    "   'I don't know based on the provided documents.' Do NOT use outside "
+    "   knowledge. Do NOT guess author names, dates, or numbers that are "
+    "   not literally present in the context. Specifically: if you mention "
+    "   a dataset / model / number / year, it MUST appear verbatim in the "
+    "   context above - otherwise omit it.\n"
+    "2. When the context contains tables or code, preserve their structure.\n"
+    "3. Cite sources inline as [filename p.<page>] using the page numbers "
+    "   shown in each context block header.\n"
+    "4. Be concise. Do not repeat yourself. Do not fabricate quotes."
+)
+
+ANSWER_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", ANSWER_SYSTEM),
+        MessagesPlaceholder("chat_history"),
+        (
+            "human",
+            "Context:\n----------\n{context}\n----------\n\n"
+            "Question: {question}\n\nAnswer:",
+        ),
+    ]
+)
+
+# Conversational fallback prompt for greetings / meta-questions / chitchat
+# where doing a vector search would be silly.
+CHITCHAT_SYSTEM = (
+    QWEN3_NO_THINK + "\n"
+    "You are a friendly assistant for a local PDF question-answering app. "
+    "The user has just sent a greeting, an introduction, a thank-you, or a "
+    "meta-question about your capabilities - NOT a question about a specific "
+    "document. Reply briefly and naturally in the same language as the user. "
+    "If appropriate, mention that you can answer questions about PDFs they "
+    "upload. Do NOT refuse, do NOT say 'I don't know based on the provided "
+    "documents'. Keep it under 3 sentences."
+)
+
+CHITCHAT_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", CHITCHAT_SYSTEM),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{question}"),
+    ]
+)
+
+
+# ---------------------------------------------------------------------------
+# Chitchat detector — short messages that match a greeting / thanks / meta
+# pattern in CN or EN, and shouldn't trigger document retrieval.
+# ---------------------------------------------------------------------------
+_CHITCHAT_PATTERNS = [
+    # English greetings / thanks / farewells
+    r"^\s*(hi|hello|hey|yo|sup|good\s+(morning|afternoon|evening|night))\b",
+    r"^\s*(thanks|thank\s+you|thx|cheers|bye|goodbye|see\s+you)\b",
+    r"^\s*(how\s+are\s+you|how's\s+it\s+going|what'?s?\s+up)\b",
+    # English meta
+    r"^\s*(who\s+are\s+you|what\s+(are\s+you|can\s+you\s+do)|what\s+is\s+this)\b",
+    r"^\s*(help|what\s+(should|can)\s+i\s+(do|ask))\b",
+    # Chinese greetings / thanks / farewells
+    r"^\s*(你好|您好|嗨|哈喽|早上?好|中午好|下午好|晚上好|晚安)",
+    r"^\s*(谢谢|多谢|感谢|拜拜|再见|回头见)",
+    r"^\s*(在吗|你在吗|忙吗)",
+    # Chinese meta
+    r"^\s*(你是谁|你叫什么|你能(做|干)什么|你是什么|介绍(一下)?自己)",
+    r"^\s*(你会什么|帮助|怎么(用|玩))",
+]
+_CHITCHAT_RE = re.compile("|".join(_CHITCHAT_PATTERNS), re.IGNORECASE)
+
+
+def is_chitchat(text: str) -> bool:
+    """Return True if the message looks like a greeting / chitchat / meta-q
+    that should bypass document retrieval."""
+    if not text:
+        return False
+    t = text.strip()
+    # Long messages are very unlikely to be pure chitchat - assume they're
+    # real questions even if they happen to start with a greeting word.
+    if len(t) > 40:
+        return False
+    return bool(_CHITCHAT_RE.search(t))
+
+
+# ---------------------------------------------------------------------------
+# LLM loader
+# ---------------------------------------------------------------------------
+def load_local_llm(config: Optional[LLMConfig] = None) -> ChatOpenAI:
+    """
+    Start (or reuse) the local llama-server process and return a langchain
+    ChatOpenAI pointed at its OpenAI-compatible endpoint.
+
+    Why a server, not in-process bindings? The Windows CUDA wheels for
+    llama-cpp-python are stuck at v0.3.4 which doesn't know the qwen3 GGUF
+    architecture. The standalone llama-server.exe from upstream llama.cpp
+    is current, GPU-enabled, and OpenAI-compatible.
+    """
+    cfg = config or LLMConfig()
+    model_path = Path(cfg.model_path).expanduser().resolve()
+
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"GGUF model not found at: {model_path}\n"
+            "Place a quantized .gguf file at ./models/model.gguf or set the "
+            "LLAMA_MODEL_PATH environment variable."
+        )
+
+    # Build the server config and start the subprocess.
+    server_cfg = cfg.server_config or ServerConfig(
+        model_path=model_path,
+        n_ctx=cfg.n_ctx,
+        n_gpu_layers=cfg.n_gpu_layers,
+    )
+    try:
+        server = get_shared_server(server_cfg)
+    except Exception as exc:
+        logger.exception("Failed to start llama-server.")
+        raise RuntimeError(f"Could not start llama-server: {exc}") from exc
+
+    try:
+        logger.info(
+            "Connecting ChatOpenAI client to llama-server at %s "
+            "(n_ctx=%d, n_gpu_layers=%d)",
+            server_cfg.openai_base_url,
+            cfg.n_ctx,
+            cfg.n_gpu_layers,
+        )
+        # llama-server doesn't enforce auth; ChatOpenAI requires *some* key.
+        llm = ChatOpenAI(
+            base_url=server_cfg.openai_base_url,
+            api_key="not-needed",
+            # The model name is whatever llama-server is configured with - it
+            # ignores the field but langchain validates non-emptiness.
+            model="local",
+            temperature=cfg.temperature,
+            max_tokens=cfg.max_tokens,
+            top_p=cfg.top_p,
+            # repeat_penalty maps onto OpenAI's frequency_penalty loosely;
+            # llama-server passes through model_kwargs as sampler params.
+            model_kwargs={
+                "frequency_penalty": 0.0,
+                "presence_penalty": 0.0,
+            },
+            timeout=600,
+            max_retries=2,
+            **cfg.extra_kwargs,
+        )
+        logger.info("ChatOpenAI client ready.")
+        return llm
+    except Exception as exc:
+        logger.exception("Failed to build ChatOpenAI client.")
+        raise RuntimeError(f"Could not build ChatOpenAI client: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Helper: format retrieved docs for the prompt
+# ---------------------------------------------------------------------------
+def format_documents(docs: List[Document]) -> str:
+    parts: List[str] = []
+    for i, d in enumerate(docs, start=1):
+        meta = d.metadata or {}
+        filename = meta.get("filename", "unknown")
+        page = meta.get("page") or meta.get("pages", "?")
+        heading = meta.get("headings", "")
+        header = f"[{i}] {filename} (p.{page})"
+        if heading:
+            header += f" — {heading}"
+        parts.append(f"{header}\n{d.page_content}")
+    return "\n\n".join(parts) if parts else "(no relevant context found)"
+
+
+# ---------------------------------------------------------------------------
+# Stateful RAG chain
+# ---------------------------------------------------------------------------
+class RAGChain:
+    """
+    Stateful RAG chain combining:
+      - per-session chat history
+      - standalone-question rewriting
+      - local Chroma retrieval
+      - local llama.cpp answer generation
+    """
+
+    def __init__(
+        self,
+        vector_store: Optional[LocalVectorStore] = None,
+        llm: Optional[ChatOpenAI] = None,
+        llm_config: Optional[LLMConfig] = None,
+        k: int = 6,
+    ) -> None:
+        self.vector_store = vector_store or build_default_store()
+        self.llm = llm or load_local_llm(llm_config)
+        self.k = k
+        self._sessions: Dict[str, BaseChatMessageHistory] = {}
+
+        self._chain = self._build_chain()
+        self._chain_with_history = RunnableWithMessageHistory(
+            self._chain,
+            self._get_session_history,
+            input_messages_key="question",
+            history_messages_key="chat_history",
+            output_messages_key="answer",
+        )
+
+        # Chitchat short-circuit: skips retrieval, calls LLM directly with
+        # the conversational prompt. Same memory backing as the main chain.
+        self._chitchat_chain = (
+            CHITCHAT_PROMPT
+            | self.llm
+            | StrOutputParser()
+            | RunnableLambda(self._strip_reasoning)
+        )
+        self._chitchat_with_history = RunnableWithMessageHistory(
+            self._chitchat_chain,
+            self._get_session_history,
+            input_messages_key="question",
+            history_messages_key="chat_history",
+        )
+
+    # ----------------------------------------------------------- session mgmt
+    def _get_session_history(self, session_id: str) -> BaseChatMessageHistory:
+        if session_id not in self._sessions:
+            self._sessions[session_id] = InMemoryChatMessageHistory()
+        return self._sessions[session_id]
+
+    def reset_session(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
+
+    # ----------------------------------------------------------- chain wiring
+    @staticmethod
+    def _strip_reasoning(text: str) -> str:
+        """
+        Remove <think>...</think> blocks emitted by reasoning models
+        (DeepSeek-R1, Qwen-Thinking, etc.). Also handles the case where
+        the model gets truncated mid-think and never closes the tag —
+        in which case we drop everything from <think> onward.
+        """
+        if not text:
+            return ""
+        # Closed think blocks
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        # Unclosed leading think (model still inside CoT when output ended)
+        text = re.sub(r"<think>.*\Z", "", text, flags=re.DOTALL | re.IGNORECASE)
+        # Strip stray tags
+        text = re.sub(r"</?think>", "", text, flags=re.IGNORECASE)
+        return text.strip()
+
+    def _build_chain(self) -> Runnable:
+        condense_chain = CONDENSE_PROMPT | self.llm | StrOutputParser()
+
+        def _post_condense_factory():
+            """Closure that has access to the original question for sanity checks."""
+            def _post(inputs: dict) -> str:
+                raw = inputs["_raw"]
+                original = inputs["question"]
+                cleaned = self._strip_reasoning(raw)
+                # Strip quotes / labels the model loves to add.
+                cleaned = re.sub(r'^["\'\s]+|["\'\s]+$', "", cleaned)
+                cleaned = re.sub(
+                    r"^(query|search query|standalone query)\s*[:\-]\s*",
+                    "", cleaned, flags=re.IGNORECASE,
+                )
+
+                # Defensive fallback: small models often regurgitate prior
+                # turns into the rewrite. If the rewrite is much longer than
+                # the original, or is empty, prefer the user's actual question.
+                if not cleaned:
+                    logger.info("Rewriter empty -> using original question.")
+                    return original
+                if len(cleaned) > max(120, 3 * len(original)):
+                    logger.info(
+                        "Rewriter output suspiciously long (%d vs original %d) "
+                        "-> using original question.",
+                        len(cleaned), len(original),
+                    )
+                    return original
+
+                logger.info("Query rewritten to: %s", cleaned)
+                return cleaned
+            return _post
+
+        post = _post_condense_factory()
+        # Keep both the raw rewrite and the original question in scope.
+        condense_chain = (
+            RunnablePassthrough.assign(_raw=condense_chain)
+            | RunnableLambda(post)
+        )
+
+        def _retrieve(state: dict) -> List[Document]:
+            # Fall back to the raw question if the rewriter produced nothing
+            # useful (common with reasoning models that get truncated).
+            query = state.get("standalone") or state["question"]
+            if not query.strip():
+                query = state["question"]
+            docs = self.vector_store.similarity_search(query, k=self.k)
+            logger.info("Retrieved %d chunks for standalone query.", len(docs))
+            return docs
+
+        # Pipeline: produce {question, chat_history, standalone, context, source_documents}
+        pipeline = (
+            RunnablePassthrough.assign(standalone=condense_chain)
+            .assign(source_documents=_retrieve)
+            .assign(context=lambda x: format_documents(x["source_documents"]))
+        )
+
+        answer_chain = (
+            ANSWER_PROMPT
+            | self.llm
+            | StrOutputParser()
+            | RunnableLambda(self._strip_reasoning)
+        )
+
+        chain = pipeline.assign(answer=answer_chain)
+        return chain
+
+    # --------------------------------------------------------------- main API
+    def ask(self, question: str, session_id: str = "default") -> dict:
+        """Run a single conversational turn. Returns the full pipeline state.
+
+        Greetings / meta-questions short-circuit to a chitchat reply that
+        skips vector retrieval entirely.
+        """
+        if not question or not question.strip():
+            raise ValueError("Question cannot be empty.")
+
+        if is_chitchat(question):
+            logger.info("Chitchat detected, bypassing retrieval.")
+            try:
+                answer = self._chitchat_with_history.invoke(
+                    {"question": question},
+                    config={"configurable": {"session_id": session_id}},
+                )
+            except Exception as exc:
+                logger.exception("Chitchat chain invocation failed.")
+                raise RuntimeError("Chitchat chain failed.") from exc
+            return {
+                "question": question,
+                "standalone_question": question,
+                "answer": answer,
+                "source_documents": [],
+                "chitchat": True,
+            }
+
+        try:
+            result = self._chain_with_history.invoke(
+                {"question": question},
+                config={"configurable": {"session_id": session_id}},
+            )
+        except Exception as exc:
+            logger.exception("RAG chain invocation failed.")
+            raise RuntimeError("RAG chain failed to produce an answer.") from exc
+
+        return {
+            "question": question,
+            "standalone_question": result.get("standalone", question),
+            "answer": result.get("answer", ""),
+            "source_documents": result.get("source_documents", []),
+            "chitchat": False,
+        }
+
+    def ask_no_memory(self, question: str) -> dict:
+        """Stateless one-shot query, useful for evaluation."""
+        try:
+            result = self._chain.invoke(
+                {"question": question, "chat_history": []}
+            )
+        except Exception as exc:
+            logger.exception("Stateless RAG chain invocation failed.")
+            raise RuntimeError("Stateless RAG chain failed.") from exc
+        return {
+            "question": question,
+            "standalone_question": result.get("standalone", question),
+            "answer": result.get("answer", ""),
+            "source_documents": result.get("source_documents", []),
+        }
+
+
+# ---------------------------------------------------------------------------
+# CLI: simple REPL for local testing
+# ---------------------------------------------------------------------------
+def main() -> None:
+    chain = RAGChain()
+    session_id = "cli"
+    print("Local RAG REPL. Ctrl-C to quit.\n")
+    try:
+        while True:
+            q = input("you> ").strip()
+            if not q:
+                continue
+            result = chain.ask(q, session_id=session_id)
+            print(f"\nbot> {result['answer']}\n")
+            srcs = result["source_documents"]
+            if srcs:
+                print("sources:")
+                for d in srcs:
+                    meta = d.metadata
+                    print(f"  - {meta.get('filename')} p.{meta.get('page', '?')}")
+                print()
+    except (KeyboardInterrupt, EOFError):
+        print("\nbye.")
+
+
+if __name__ == "__main__":
+    main()

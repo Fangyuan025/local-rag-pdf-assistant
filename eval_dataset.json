@@ -1,0 +1,14 @@
+[
+  {
+    "question": "What dataset was used for the English-German translation experiments?",
+    "ground_truth": "The standard WMT 2014 English-German dataset, consisting of about 4.5 million sentence pairs."
+  },
+  {
+    "question": "What is the dimensionality of the model (d_model) in the base Transformer?",
+    "ground_truth": "The base Transformer model uses d_model = 512."
+  },
+  {
+    "question": "How many encoder and decoder layers does the base Transformer have?",
+    "ground_truth": "Both the encoder and the decoder are composed of a stack of N = 6 identical layers."
+  }
+]
