@@ -120,6 +120,44 @@ Main pane: chat. Each answer shows expandable **Sources** (file + page +
 heading + snippet) and **Standalone search query** (the rewritten query that
 drove retrieval).
 
+#### Walkthrough
+
+**1. Initial state.** First launch shows an empty vector store
+(`0 chunks`). The chat input is enabled but answers will say
+"I don't know based on the provided documents" until you index something —
+unless the message is a greeting / chitchat, which short-circuits to a
+conversational reply (see step 4).
+
+![Initial UI](screenshots/UI.png)
+
+**2. Pick a PDF.** Use the **Upload** widget in the sidebar. Files queue up
+visually but aren't indexed yet — the **Ingest & Index** button is what
+actually runs Docling + the embedder. Leave **Replace existing index on
+upload** ticked (default) if you want each upload to start from a clean
+store.
+
+![Step 1 — file selected, ready to ingest](screenshots/Step%201.png)
+
+**3. Ingest & Index.** Click the button. The status panel reports per-file
+progress; on success the sidebar shows `Indexed N/N file(s) (M chunks)`,
+the vector store size updates, and a **🗑 Clear all documents** button
+appears alongside an **Indexed documents (N)** expander listing exactly
+what's searchable.
+
+![Step 2 — ingest complete, store now has 91 chunks](screenshots/Step%202.png)
+
+**4. Chat.** Two paths share the same memory:
+
+- A short greeting like `Hello` triggers the **chitchat short-circuit**:
+  no retrieval, no sources, just a friendly conversational reply.
+- A real document question (`What's this essay about?`) goes through the
+  full pipeline — standalone-question rewrite → vector search → grounded
+  answer. Each answer comes with collapsible **Sources** (file + page +
+  heading + snippet) and **Standalone search query** (the rewriter's
+  output, exposed for debugging).
+
+![Step 3 — chitchat reply followed by a grounded RAG answer](screenshots/Step%203.png)
+
 ### CLI smoke test
 
 ```powershell
