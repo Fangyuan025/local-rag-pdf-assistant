@@ -196,6 +196,72 @@ def is_chitchat(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Streaming <think>...</think> filter for reasoning models.
+# ---------------------------------------------------------------------------
+class _ThinkStripFilter:
+    """
+    Incremental filter that swallows the first ``<think>...</think>`` block
+    of a streamed model output. Used to keep CoT tokens out of the user's
+    chat bubble while still streaming the actual answer.
+
+    Handles partial tags split across chunk boundaries (e.g. one chunk ends
+    with ``<thi`` and the next starts with ``nk>``) by buffering up to
+    ``len('</think>') - 1`` characters at the tail.
+    """
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_think = False
+        self._post_think = False  # already passed through one think block
+
+    def feed(self, chunk: str) -> str:
+        """Consume the next streamed chunk, return text safe to display."""
+        if self._post_think:
+            return chunk
+
+        self._buf += chunk
+        out = ""
+        while self._buf:
+            if self._in_think:
+                idx = self._buf.find(self.CLOSE)
+                if idx < 0:
+                    # Keep just enough tail in case </think> straddles.
+                    keep = max(0, len(self._buf) - (len(self.CLOSE) - 1))
+                    self._buf = self._buf[keep:]
+                    return out
+                self._buf = self._buf[idx + len(self.CLOSE):]
+                self._in_think = False
+                self._post_think = True
+                out += self._buf
+                self._buf = ""
+                return out
+            else:
+                idx = self._buf.find(self.OPEN)
+                if idx < 0:
+                    # No opener seen yet. Emit everything except a possible
+                    # partial-prefix tail like "<thin".
+                    keep = max(0, len(self._buf) - (len(self.OPEN) - 1))
+                    out += self._buf[:keep]
+                    self._buf = self._buf[keep:]
+                    return out
+                # Emit pre-tag text, then enter think state.
+                out += self._buf[:idx]
+                self._buf = self._buf[idx + len(self.OPEN):]
+                self._in_think = True
+        return out
+
+    def flush(self) -> str:
+        """Emit anything still buffered when the stream ends."""
+        if self._in_think:
+            return ""  # truncated mid-think → drop
+        out, self._buf = self._buf, ""
+        return out
+
+
+# ---------------------------------------------------------------------------
 # LLM loader
 # ---------------------------------------------------------------------------
 def load_local_llm(config: Optional[LLMConfig] = None) -> ChatOpenAI:
@@ -419,6 +485,11 @@ class RAGChain:
             )
             return docs
 
+        # Bind helpers we'll need from the streaming path too.
+        self._post_condense = post
+        self._retrieve_fn = _retrieve
+        self._condense_chain = condense_chain
+
         # Pipeline: produce {question, chat_history, standalone, context, source_documents}
         pipeline = (
             RunnablePassthrough.assign(standalone=condense_chain)
@@ -523,6 +594,125 @@ class RAGChain:
             "source_documents": result.get("source_documents", []),
             "scope": list(filenames) if filenames else None,
         }
+
+    # ------------------------------------------------------------ streaming
+    def stream(
+        self,
+        question: str,
+        session_id: str = "default",
+        filenames: Optional[List[str]] = None,
+    ):
+        """
+        Token-by-token streaming variant of ``ask``. Yields tagged events:
+
+          - ``("standalone", str)``   — the rewritten / fallback search query
+          - ``("sources", List[Doc])``— retrieved chunks (RAG path only)
+          - ``("token", str)``        — incremental answer text (with
+            ``<think>...</think>`` blocks already stripped)
+          - ``("done", dict)``        — final result, same shape as ``ask``
+
+        Memory is updated with the cleaned full answer at the end of the
+        stream, mirroring what RunnableWithMessageHistory does for ``ask``.
+        """
+        if not question or not question.strip():
+            raise ValueError("Question cannot be empty.")
+
+        history = self._get_session_history(session_id)
+        chat_history = list(history.messages)
+
+        # ---- chitchat path ----------------------------------------------
+        if is_chitchat(question):
+            logger.info("Chitchat detected, bypassing retrieval (streaming).")
+            yield ("standalone", question)
+            yield ("sources", [])
+
+            messages = CHITCHAT_PROMPT.format_messages(
+                chat_history=chat_history,
+                question=question,
+            )
+            full_raw = ""
+            stripper = _ThinkStripFilter()
+            for chunk in self.llm.stream(messages):
+                piece = getattr(chunk, "content", str(chunk)) or ""
+                if not piece:
+                    continue
+                full_raw += piece
+                visible = stripper.feed(piece)
+                if visible:
+                    yield ("token", visible)
+            tail = stripper.flush()
+            if tail:
+                yield ("token", tail)
+
+            cleaned = self._strip_reasoning(full_raw)
+            history.add_user_message(question)
+            history.add_ai_message(cleaned)
+
+            yield ("done", {
+                "question": question,
+                "standalone_question": question,
+                "answer": cleaned,
+                "source_documents": [],
+                "chitchat": True,
+                "scope": None,
+            })
+            return
+
+        # ---- RAG path ---------------------------------------------------
+        # 1. Standalone-question rewrite (non-streaming, short).
+        try:
+            raw = self._condense_chain.invoke(
+                {"question": question, "chat_history": chat_history}
+            )
+        except Exception as exc:
+            logger.exception("Condense chain failed during streaming.")
+            raise RuntimeError("Failed to rewrite query.") from exc
+        standalone = self._post_condense({"_raw": raw, "question": question})
+        yield ("standalone", standalone)
+
+        # 2. Retrieve.
+        state = {"question": question, "standalone": standalone}
+        if filenames:
+            state["filenames"] = list(filenames)
+        docs = self._retrieve_fn(state)
+        yield ("sources", docs)
+
+        # 3. Stream the grounded answer.
+        messages = ANSWER_PROMPT.format_messages(
+            chat_history=chat_history,
+            context=format_documents(docs),
+            question=question,
+        )
+        full_raw = ""
+        stripper = _ThinkStripFilter()
+        try:
+            for chunk in self.llm.stream(messages):
+                piece = getattr(chunk, "content", str(chunk)) or ""
+                if not piece:
+                    continue
+                full_raw += piece
+                visible = stripper.feed(piece)
+                if visible:
+                    yield ("token", visible)
+            tail = stripper.flush()
+            if tail:
+                yield ("token", tail)
+        except Exception as exc:
+            logger.exception("Streaming answer generation failed.")
+            raise RuntimeError("Streaming generation failed.") from exc
+
+        cleaned = self._strip_reasoning(full_raw)
+        history.add_user_message(question)
+        history.add_ai_message(cleaned)
+
+        yield ("done", {
+            "question": question,
+            "standalone_question": standalone,
+            "answer": cleaned,
+            "source_documents": docs,
+            "chitchat": False,
+            "scope": list(filenames) if filenames else None,
+        })
 
 
 # ---------------------------------------------------------------------------

@@ -281,21 +281,46 @@ if prompt:
         all_indexed = _list_indexed_filenames()
         scope_arg = None if (not scope or set(scope) == set(all_indexed)) else list(scope)
 
-        with st.spinner("Thinking locally..."):
+        # The chain.stream() generator yields tagged events:
+        #   ('standalone', str), ('sources', List[Doc]), ('token', str), ('done', dict)
+        # We feed only the 'token' events into st.write_stream for the
+        # typewriter effect, while side-channel-capturing the rest.
+        captures: dict = {}
+        def _token_only():
             try:
-                result = chain.ask(
+                for kind, payload in chain.stream(
                     prompt,
                     session_id=st.session_state.session_id,
                     filenames=scope_arg,
-                )
+                ):
+                    if kind == "token":
+                        yield payload
+                    else:
+                        captures[kind] = payload
             except Exception as exc:
-                err = f"Error during RAG query: {exc}"
-                st.error(err)
-                st.session_state.messages.append({"role": "assistant", "content": err})
-                st.stop()
+                logger.exception("Streaming RAG failed")
+                captures["error"] = str(exc)
 
-        answer = result["answer"] or "_(empty response)_"
-        st.markdown(answer)
+        # Optional pre-stream hint while standalone+retrieval run.
+        with st.spinner("Retrieving and generating..."):
+            answer = st.write_stream(_token_only())
+
+        if captures.get("error"):
+            err = f"Error during RAG query: {captures['error']}"
+            st.error(err)
+            st.session_state.messages.append({"role": "assistant", "content": err})
+            st.stop()
+
+        # The chain emits a final ('done', result) with everything reassembled.
+        result = captures.get("done", {
+            "answer": answer,
+            "source_documents": captures.get("sources", []),
+            "standalone_question": captures.get("standalone", prompt),
+            "chitchat": False,
+            "scope": scope_arg,
+        })
+        if not answer:
+            answer = result.get("answer") or "_(empty response)_"
 
         sources_payload = []
         if result["source_documents"]:
