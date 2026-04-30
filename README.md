@@ -3,22 +3,24 @@
 A fully offline, GPU-accelerated, stateful RAG assistant for PDFs. Parses
 documents with **IBM Docling** (preserves tables, code, math), embeds with
 **sentence-transformers**, persists in **ChromaDB**, and answers via a local
-**llama.cpp** server with any GGUF model. Streamlit UI on top, Ragas
-evaluation on the side. No cloud, no API keys.
+**llama.cpp** server with any GGUF model. Streamlit UI on top with
+**token-by-token streaming**, multi-document scope filtering, automatic
+**Chinese / English language matching**, and a citation-anchored sources
+view. Ragas evaluation on the side. No cloud, no API keys.
 
 ## Architecture
 
 ```
-   ┌────────────┐    HTTP / OpenAI API    ┌──────────────────┐
-   │  app.py    │  ─────────────────────► │ llama-server.exe │
-   │ (Streamlit)│                         │  GPU CUDA, GGUF  │
-   └─────┬──────┘                         └──────────────────┘
+   ┌────────────┐    streaming HTTP / OpenAI API    ┌──────────────────┐
+   │  app.py    │  ───────────────────────────────► │ llama-server.exe │
+   │ (Streamlit)│                                   │  GPU CUDA, GGUF  │
+   └─────┬──────┘                                   └──────────────────┘
          │ uses
          ▼
-   ┌──────────────────┐    embed     ┌────────────────┐
-   │   llm_chain.py   │  ─────────►  │   ChromaDB     │
-   │ (LangChain RAG)  │              │  (persistent)  │
-   └─────┬────────────┘              └────────────────┘
+   ┌──────────────────┐    embed     ┌─────────────────────────┐
+   │   llm_chain.py   │  ─────────►  │  ChromaDB (persistent)  │
+   │ (LangChain RAG)  │              │  + summaries.json cache │
+   └─────┬────────────┘              └─────────────────────────┘
          │ retrieve
          ▼
    ┌──────────────┐
@@ -26,22 +28,44 @@ evaluation on the side. No cloud, no API keys.
    └──────────────┘
 ```
 
-The chain has two paths:
-- **Chitchat** ("你好" / "hello" / "thank you" / meta-questions) → bypasses
-  retrieval, replies conversationally.
-- **Document query** → standalone-question rewrite → vector search → grounded
-  answer with inline citations `[file p.<page>]`.
+Per-turn flow inside `llm_chain.py`:
+
+1. **Language detection** — classifies the user message as `zh` or `en`
+   and prepares a `language_directive` for the prompt.
+2. **Routing** — `is_chitchat(text, has_history=...)` decides:
+   - **Chitchat** ("你好" / "早安" / "Hello" / "introduce yourself" /
+     thanks / farewells / capability questions) → bypasses retrieval and
+     hits a friendly conversational prompt.
+   - **Document query** → continues to step 3.
+3. **Standalone-question rewrite** — resolves pronouns and short
+   follow-ups ("why?", "为什么？") against chat history. Defensive
+   fallback: if the rewrite is empty or suspiciously long, the raw
+   question is used. For very short follow-ups, a snippet of the
+   previous assistant message is appended to the search query so
+   similarity hits something even when the rewriter under-performs.
+4. **Retrieval** — single-doc scope uses plain top-k similarity; multi-
+   doc scope uses *balanced* retrieval that allocates the budget evenly
+   across the in-scope filenames, so one semantically dominant document
+   can not crowd the others out.
+5. **Context build** — prepends a "Documents in scope" overview from
+   the per-PDF summary cache to the retrieved excerpts.
+6. **Streaming answer** — tokens are streamed straight from the model
+   into Streamlit; a small FSM strips `<think>...</think>` blocks
+   inline so reasoning never reaches the UI.
+7. **Citation filter** — the displayed Sources list shows only the
+   excerpts the answer actually cites with `[filename p.<page>]`.
 
 ## Project layout
 
 | File | What it does |
 |---|---|
 | `ingest.py` | PDF → Docling → HybridChunker → LangChain `Document`s with rich metadata (headings, page numbers, content type). |
-| `vector_store.py` | HuggingFace `all-MiniLM-L6-v2` embeddings + persistent ChromaDB collection at `./chroma_db`. Idempotent upserts via SHA-256 IDs. |
+| `vector_store.py` | HuggingFace `all-MiniLM-L6-v2` embeddings + persistent ChromaDB collection at `./chroma_db`. Idempotent upserts via SHA-256 IDs. Filename-scoped + balanced multi-doc retrieval. |
 | `llama_server.py` | Lifecycle manager for the standalone `llama-server.exe` (subprocess + `/health` polling + auto-shutdown). |
-| `llm_chain.py` | `LLMConfig`, `RAGChain` (memory + standalone-question rewriter + chitchat short-circuit), `ChatOpenAI` client pointed at the local server. |
+| `llm_chain.py` | `LLMConfig`, `RAGChain` (streaming, memory, language detection, standalone-question rewriter with follow-up boost, chitchat short-circuit, citation parser), `ChatOpenAI` client pointed at the local server. |
+| `doc_summaries.py` | Per-PDF 2–3 sentence summary cache (`chroma_db/summaries.json`). Generated once at ingest, injected into the answer prompt as a "Documents in scope" overview. |
 | `evaluate.py` | Offline Ragas evaluation. Computes Context Precision / Faithfulness / Answer Relevancy with the LOCAL judge LLM. Writes JSON+CSV to `eval_results/`. |
-| `app.py` | Streamlit chat UI. Sidebar: upload + replace-or-append index + clear-all-documents button. Main pane: stateful chat with source citations. |
+| `app.py` | Streamlit chat UI: upload, replace-or-append, clear-all, multi-doc scope multiselect, live scope indicator, streaming answers, citation-filtered sources. |
 | `smoke_test.py` | End-to-end smoke test (3 questions against the indexed PDFs). |
 | `eval_dataset.json` | Sample test set for `evaluate.py`. |
 
@@ -110,15 +134,23 @@ streamlit run app.py
 ```
 
 Sidebar:
-- **Upload PDF(s)** + **Ingest & Index** to add to the vector store
-- **Replace existing index on upload** (default on) — wipes ChromaDB before
-  ingesting so queries only see the new docs
-- **🗑 Clear all documents** — manual nuke button
-- **Indexed documents (N)** — live list of what's currently searchable
+- **Upload PDF(s)** + **Ingest & Index** — runs Docling, embeds chunks
+  into ChromaDB, and generates a 2–3 sentence summary per PDF (one extra
+  short LLM call) for the "Documents in scope" overview.
+- **Replace existing index on upload** (default on) — wipes ChromaDB and
+  the summaries cache before ingesting so queries only see the new docs.
+- **🗑 Clear all documents** — manual nuke (chunks + summaries).
+- **Search in (N indexed)** — multi-select to restrict each query to a
+  subset of indexed PDFs. Empty or all-selected ≡ "search everything".
 
-Main pane: chat. Each answer shows expandable **Sources** (file + page +
-heading + snippet) and **Standalone search query** (the rewritten query that
-drove retrieval).
+Main pane:
+- A small caption above the input shows the live retrieval scope.
+- Answers stream in token-by-token (typewriter effect).
+- Each answer shows an expandable **Sources** panel listing only the
+  excerpts the answer actually cited with `[filename p.<page>]`; if any
+  retrieved excerpts went uncited they appear as a count badge.
+- A second expander **Standalone search query** exposes the rewritten
+  query that drove retrieval, useful for debugging.
 
 #### Walkthrough
 
@@ -141,20 +173,21 @@ store.
 **3. Ingest & Index.** Click the button. The status panel reports per-file
 progress; on success the sidebar shows `Indexed N/N file(s) (M chunks)`,
 the vector store size updates, and a **🗑 Clear all documents** button
-appears alongside an **Indexed documents (N)** expander listing exactly
-what's searchable.
+plus a **Search in (N indexed)** multi-select appear so you can constrain
+each query to specific PDFs.
 
-![Step 2 — ingest complete, store now has 91 chunks](screenshots/Step%202.png)
+![Step 2 — ingest complete, store size shown in sidebar](screenshots/Step%202.png)
 
 **4. Chat.** Two paths share the same memory:
 
-- A short greeting like `Hello` triggers the **chitchat short-circuit**:
-  no retrieval, no sources, just a friendly conversational reply.
-- A real document question (`What's this essay about?`) goes through the
-  full pipeline — standalone-question rewrite → vector search → grounded
-  answer. Each answer comes with collapsible **Sources** (file + page +
-  heading + snippet) and **Standalone search query** (the rewriter's
-  output, exposed for debugging).
+- A short greeting like `Hello` or `早安` triggers the **chitchat
+  short-circuit**: no retrieval, no sources, just a friendly conversational
+  reply in the user's own language.
+- A real document question (`What's this essay about?` / `这两篇文章讲了什么？`)
+  goes through the full pipeline — language detection → standalone-question
+  rewrite → balanced retrieval (when 2+ docs are in scope) → streamed
+  answer with inline `[file p.<page>]` citations. The displayed Sources
+  list is filtered to those citations.
 
 ![Step 3 — chitchat reply followed by a grounded RAG answer](screenshots/Step%203.png)
 
@@ -209,16 +242,57 @@ single-sentence chunks (e.g. just a section header). `HybridChunker` merges
 adjacent peers up to a token budget, so each chunk carries enough context
 for high-precision retrieval.
 
-**Defensive standalone-query rewrite.** Small reasoning models sometimes
-regurgitate prior conversation turns into the rewritten query, or emit
-SQL, or get truncated mid-`<think>`. The chain detects these failure
-modes (length heuristic + `<think>` stripping) and falls back to the raw
-user question.
+**Per-PDF doc summaries.** Vanilla top-k similarity is bad at high-level
+questions ("which one is about ML?", "summarize this paper") because the
+chunks alone don't carry document-level themes. At ingest time we make one
+short LLM call per PDF for a 2–3 sentence summary and cache it in
+`chroma_db/summaries.json`. The summaries are prepended to the answer-prompt
+context as a "Documents in scope" overview, giving the model a macro-view
+even when retrieved excerpts skew toward one file.
 
-**Chitchat short-circuit.** A regex-based detector matches common greetings,
-thanks, farewells, and meta-questions in CN+EN. These bypass retrieval and
-hit a friendly conversational prompt instead — so "你好" no longer gets
-answered with "I don't know based on the provided documents."
+**Balanced multi-doc retrieval.** When 2+ PDFs are in scope, retrieval
+allocates the budget evenly across filenames (k // N per doc, with leftover
+distributed first-come). Without this, a semantically dominant document
+crowds the others out and questions like "what's common between the two?"
+become unanswerable.
+
+**Citation-filtered Sources.** The model is instructed to cite as
+`[filename p.<page>]`. After the answer streams in, a regex pulls those
+citations out, and the Sources panel shows only the cited excerpts. The
+full retrieved set is kept under `all_source_documents` for callers that
+want it; the UI displays a count badge if some retrieved excerpts ended
+up uncited.
+
+**Per-turn language directive.** Small models drift toward the language
+of the source documents (usually English) regardless of the user's
+language. We detect each user message as `zh` or `en` based on CJK
+character ratio and splice the language directive into the user message
+*immediately before* `Answer:` — that's the most-recent-token slot, which
+small models obey most reliably. Drift is re-corrected each turn rather
+than relying on a system-prompt hint that decays over long context.
+
+**Defensive standalone-query rewrite + follow-up boost.** Small reasoning
+models sometimes regurgitate prior conversation turns into the rewritten
+query, or emit SQL, or get truncated mid-`<think>`. The chain detects
+those failure modes (length heuristic + `<think>` stripping) and falls
+back to the raw question. For very short follow-ups (`why?` / `为什么？`),
+a snippet of the previous assistant message is appended to the search
+query as a safety net so retrieval still has something to anchor on even
+when the rewriter under-performs.
+
+**Streaming with inline `<think>` stripping.** Tokens stream from
+`llama-server` straight into Streamlit's `st.write_stream`. A small FSM
+swallows the first `<think>...</think>` block as it goes — including the
+case where the open or close tag is split across two streamed chunks.
+First token visible in ~0.5 s for chitchat, ~2 s for RAG.
+
+**Chitchat short-circuit.** A regex-based detector matches common
+greetings, thanks, farewells, and identity / capability questions in
+CN+EN ("hello", "Hi", "Morning!", "你好", "早安", "介绍一下你自己", "thank
+you", "Howdy", etc.). These bypass retrieval and hit a friendly
+conversational prompt instead. Ambiguous short utterances ("why?",
+"为什么？") are NOT treated as chitchat when there is prior chat
+history — they go through the RAG path so the rewriter can expand them.
 
 ## License
 
