@@ -26,6 +26,7 @@ import streamlit as st
 from ingest import PDFIngestor
 from vector_store import LocalVectorStore, build_default_store
 from llm_chain import RAGChain
+import doc_summaries
 
 logging.basicConfig(
     level=logging.INFO,
@@ -116,6 +117,18 @@ def _ingest_and_index(paths: List[Path]) -> tuple[int, int]:
             total_chunks += result.chunk_count
             succeeded += 1
             st.session_state.indexed_files.append(p.name)
+
+            # Generate a doc-level summary right after indexing. The chain
+            # is already loaded (we just embedded), so this is one extra
+            # short LLM call per PDF. Cached to disk; idempotent.
+            try:
+                chain = get_chain()
+                full_text = result.markdown or "\n\n".join(
+                    d.page_content for d in result.documents
+                )
+                chain.summarize_document(p.name, full_text)
+            except Exception:
+                logger.exception("Summary generation failed for %s", p.name)
         except Exception as exc:
             logger.exception("Failed to index %s", p)
             st.error(f"Failed to index {p.name}: {exc}")
@@ -162,12 +175,14 @@ with st.sidebar:
                 if replace_index:
                     st.write("Wiping existing vector store...")
                     get_vector_store().reset()
+                    doc_summaries.clear_all()
                     st.session_state.indexed_files = []
                 paths = _save_uploaded_files(uploaded)
                 st.write(f"Saved {len(paths)} file(s) to {UPLOAD_DIR}.")
                 ok, chunks = _ingest_and_index(paths)
                 status.update(
-                    label=f"Indexed {ok}/{len(paths)} file(s) ({chunks} chunks).",
+                    label=f"Indexed {ok}/{len(paths)} file(s) ({chunks} chunks). "
+                          f"Doc-level summaries generated.",
                     state="complete",
                 )
             except Exception as exc:
@@ -194,8 +209,9 @@ with st.sidebar:
     # Wipe-everything button — separate from "Clear Chat" to avoid accidents.
     if store is not None and store_count > 0:
         if st.button("\U0001F5D1 Clear all documents", use_container_width=True,
-                     help="Permanently delete every chunk from the vector store."):
+                     help="Permanently delete every chunk + summary from the vector store."):
             store.reset()
+            doc_summaries.clear_all()
             st.session_state.indexed_files = []
             st.success("Vector store wiped.")
             st.rerun()
@@ -232,7 +248,7 @@ st.title("\U0001F4DA Local PDF RAG Assistant")
 st.caption("Offline RAG over your PDFs — Docling + ChromaDB + llama.cpp + LangChain.")
 
 # Render past messages.
-for msg in st.session_state.messages:
+for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg.get("sources"):
@@ -244,6 +260,22 @@ for msg in st.session_state.messages:
                         label += f" — {meta['headings']}"
                     st.markdown(label)
                     st.markdown(f"> {s.get('snippet', '')}")
+        # Only the LAST assistant message gets clickable follow-up chips;
+        # earlier suggestions are stale once the conversation moves on.
+        if (
+            msg["role"] == "assistant"
+            and i == len(st.session_state.messages) - 1
+            and msg.get("suggestions")
+        ):
+            st.caption("✨ Suggested follow-ups:")
+            cols = st.columns(min(3, len(msg["suggestions"])))
+            for j, q in enumerate(msg["suggestions"][:3]):
+                if cols[j % len(cols)].button(
+                    q, key=f"sugg_{i}_{j}", use_container_width=True,
+                ):
+                    # Re-inject as the next user message via session state.
+                    st.session_state["__pending_prompt__"] = q
+                    st.rerun()
 
 # Tiny scope indicator so users understand what each query will search.
 _indexed = _list_indexed_filenames()
@@ -258,8 +290,10 @@ if _indexed:
 else:
     st.caption("\U0001F4C2 No documents indexed yet — upload a PDF to start.")
 
-# Input.
+# Input. A pending suggestion-chip click is replayed as if the user typed it.
 prompt = st.chat_input("Ask a question about your PDFs...")
+if not prompt and st.session_state.get("__pending_prompt__"):
+    prompt = st.session_state.pop("__pending_prompt__")
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -315,6 +349,7 @@ if prompt:
         result = captures.get("done", {
             "answer": answer,
             "source_documents": captures.get("sources", []),
+            "all_source_documents": captures.get("sources", []),
             "standalone_question": captures.get("standalone", prompt),
             "chitchat": False,
             "scope": scope_arg,
@@ -322,26 +357,55 @@ if prompt:
         if not answer:
             answer = result.get("answer") or "_(empty response)_"
 
+        # Cited sources (filtered by [filename p.X] in the answer) are the
+        # default view; the full list is accessible via a checkbox below.
+        cited_sources = result.get("source_documents", [])
+        all_sources = result.get("all_source_documents", cited_sources)
+
         sources_payload = []
-        if result["source_documents"]:
-            with st.expander("Sources"):
-                for d in result["source_documents"]:
+        if cited_sources:
+            label = (
+                f"Sources cited ({len(cited_sources)})"
+                if len(cited_sources) < len(all_sources)
+                else "Sources"
+            )
+            with st.expander(label):
+                if len(cited_sources) < len(all_sources):
+                    st.caption(
+                        f"Showing only the {len(cited_sources)} excerpts the "
+                        f"answer cites; {len(all_sources) - len(cited_sources)} "
+                        f"additional retrieved excerpts were not cited."
+                    )
+                for d in cited_sources:
                     meta = d.metadata or {}
-                    label = f"**{meta.get('filename', 'unknown')}** — p.{meta.get('page', '?')}"
+                    head = f"**{meta.get('filename', 'unknown')}** — p.{meta.get('page', '?')}"
                     if meta.get("headings"):
-                        label += f" — {meta['headings']}"
+                        head += f" — {meta['headings']}"
                     snippet = d.page_content[:400] + ("..." if len(d.page_content) > 400 else "")
-                    st.markdown(label)
+                    st.markdown(head)
                     st.markdown(f"> {snippet}")
                     sources_payload.append({"metadata": meta, "snippet": snippet})
 
-        # Hide the standalone-query debug expander on chitchat turns - the
-        # rewriter never ran and the field is just an echo of the user's
-        # message, which would be confusing to display.
+        # Hide the standalone-query debug expander on chitchat turns.
         if not result.get("chitchat"):
             with st.expander("Standalone search query"):
                 st.code(result.get("standalone_question", ""))
 
-        st.session_state.messages.append(
-            {"role": "assistant", "content": answer, "sources": sources_payload}
-        )
+        # Suggested follow-up questions: 3 short, document-anchored prompts
+        # the user might naturally ask next. Hidden during chitchat turns.
+        suggestions: List[str] = []
+        if not result.get("chitchat") and answer:
+            try:
+                suggestions = chain.suggest_followups(
+                    last_question=prompt,
+                    last_answer=answer,
+                )
+            except Exception:
+                logger.exception("Failed to generate follow-up suggestions")
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "sources": sources_payload,
+            "suggestions": suggestions,
+        })
