@@ -119,10 +119,21 @@ ANSWER_SYSTEM = (
     "   not literally present in the context. Specifically: if you mention "
     "   a dataset / model / number / year, it MUST appear verbatim in the "
     "   context above - otherwise omit it.\n"
-    "2. When the context contains tables or code, preserve their structure.\n"
-    "3. Cite sources inline as [filename p.<page>] using the page numbers "
+    "2. The context may contain excerpts from MULTIPLE different documents, "
+    "   each prefixed with '--- From <filename> (page <n>) ---'. For "
+    "   comparative or cross-document questions ('what's common', "
+    "   'which one is about X', 'compare them', 'differences'), distinguish "
+    "   the documents clearly and ONLY attribute a claim to the file it "
+    "   actually came from. Do NOT invent commonalities, do NOT mix facts "
+    "   across files. If the documents have nothing meaningful in common, "
+    "   say so plainly.\n"
+    "3. Synthesize ONE coherent prose answer. Do NOT enumerate context "
+    "   excerpts one-by-one ('[1] ...; [2] ...') - that is a chunk-by-chunk "
+    "   commentary, not an answer. The user wants the conclusion.\n"
+    "4. When the context contains tables or code, preserve their structure.\n"
+    "5. Cite sources inline as [filename p.<page>] using the page numbers "
     "   shown in each context block header.\n"
-    "4. Be concise. Do not repeat yourself. Do not fabricate quotes."
+    "6. Be concise. Do not repeat yourself. Do not fabricate quotes."
 )
 
 ANSWER_PROMPT = ChatPromptTemplate.from_messages(
@@ -335,15 +346,23 @@ def load_local_llm(config: Optional[LLMConfig] = None) -> ChatOpenAI:
 # Helper: format retrieved docs for the prompt
 # ---------------------------------------------------------------------------
 def format_documents(docs: List[Document]) -> str:
+    """Render retrieved chunks for the answer prompt.
+
+    Avoids leading [1]/[2]/[3] numbering on purpose: small models tend to
+    mirror that pattern and produce 'enumerate-each-chunk' answers instead
+    of synthesizing. Natural-language headers keep the citations available
+    without inviting the format to be copied verbatim into the reply.
+    """
     parts: List[str] = []
-    for i, d in enumerate(docs, start=1):
+    for d in docs:
         meta = d.metadata or {}
         filename = meta.get("filename", "unknown")
         page = meta.get("page") or meta.get("pages", "?")
         heading = meta.get("headings", "")
-        header = f"[{i}] {filename} (p.{page})"
+        header = f"--- From {filename} (page {page})"
         if heading:
-            header += f" — {heading}"
+            header += f", section: {heading}"
+        header += " ---"
         parts.append(f"{header}\n{d.page_content}")
     return "\n\n".join(parts) if parts else "(no relevant context found)"
 
@@ -475,13 +494,31 @@ class RAGChain:
             # retrieval to. Prevents cross-document interference when the
             # vector store holds multiple PDFs.
             filenames = state.get("filenames") or None
-            docs = self.vector_store.similarity_search(
-                query, k=self.k, filenames=filenames
+
+            # Decide effective scope: explicit list, else everything indexed.
+            effective_scope = (
+                filenames if filenames else self.vector_store.list_filenames()
             )
+
+            # Balanced retrieval whenever 2+ docs are in play. Keeps a single
+            # semantically-dominant doc from crowding out the rest, which
+            # otherwise makes 'what's common between the two' or 'which one
+            # is about X' unanswerable.
+            if len(effective_scope) >= 2:
+                docs = self.vector_store.similarity_search_balanced(
+                    query, k=self.k, filenames=effective_scope,
+                )
+                mode = "balanced"
+            else:
+                docs = self.vector_store.similarity_search(
+                    query, k=self.k, filenames=filenames,
+                )
+                mode = "topk"
+
             scope_label = ",".join(filenames) if filenames else "ALL"
             logger.info(
-                "Retrieved %d chunks for standalone query (scope: %s).",
-                len(docs), scope_label,
+                "Retrieved %d chunks (%s, scope: %s).",
+                len(docs), mode, scope_label,
             )
             return docs
 

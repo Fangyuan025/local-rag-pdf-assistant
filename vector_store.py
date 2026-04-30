@@ -245,6 +245,40 @@ class LocalVectorStore:
         names = {(m or {}).get("filename") for m in data.get("metadatas", [])}
         return sorted(n for n in names if n)
 
+    def similarity_search_balanced(
+        self,
+        query: str,
+        k: int = 6,
+        filenames: Optional[Sequence[str]] = None,
+    ) -> List[Document]:
+        """
+        Cross-document balanced retrieval. Allocates the budget evenly across
+        the in-scope filenames so a single semantically-dominant document can
+        not crowd out the others. Falls back to plain similarity_search when
+        only one (or zero) filenames are in scope.
+
+        Used for queries like 'what's common between the two essays?' where
+        top-k by raw similarity often returns chunks from just one of them
+        and the LLM ends up answering as if the other doesn't exist.
+        """
+        scope = list(filenames) if filenames else self.list_filenames()
+        if len(scope) <= 1:
+            return self.similarity_search(query, k=k, filenames=scope or None)
+
+        per_doc = max(1, k // len(scope))
+        bonus = k - per_doc * len(scope)  # distribute leftover
+        results: List[Document] = []
+        for i, fn in enumerate(scope):
+            take = per_doc + (1 if i < bonus else 0)
+            results.extend(
+                self.similarity_search(query, k=take, filenames=[fn])
+            )
+        logger.info(
+            "Balanced retrieval: %d chunks across %d docs (~%d/doc).",
+            len(results), len(scope), per_doc,
+        )
+        return results
+
 
 # ---------------------------------------------------------------------------
 # Convenience top-level helpers
