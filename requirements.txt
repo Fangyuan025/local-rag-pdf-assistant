@@ -23,7 +23,13 @@ langchain-openai>=0.2.0      # ChatOpenAI client pointed at llama-server
 ragas>=0.2.0
 datasets>=2.20.0
 
-# --- Frontend ---
+# --- HTTP API ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9      # FastAPI multipart/form-data uploads
+sse-starlette>=2.1.0         # Server-Sent Events for streaming chat
+
+# --- Frontend (legacy Streamlit, kept until v2 React UI ships) ---
 streamlit>=1.36.0
 
 # --- Optional: voice mode (English only) ---
