@@ -14,6 +14,7 @@ import os
 # and PyTorch coexist in the same process. MUST run before any heavy imports.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+import base64
 import logging
 import shutil
 import tempfile
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import List
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from ingest import PDFIngestor
 from vector_store import LocalVectorStore, build_default_store
@@ -81,6 +83,27 @@ if "indexed_files" not in st.session_state:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _autoplay_audio(audio_bytes: bytes, key: str) -> None:
+    """Play `audio_bytes` immediately on render with NO visible UI.
+
+    Uses a hidden HTML5 `<audio autoplay>` element instead of `st.audio`
+    so the user doesn't see Streamlit's full-width progress bar after
+    every answer. The `key` query-string forces the browser to treat
+    each render as a fresh element so replay clicks restart playback
+    even if the same bytes are re-rendered.
+    """
+    if not audio_bytes:
+        return
+    b64 = base64.b64encode(audio_bytes).decode("ascii")
+    components.html(
+        f"""
+        <audio id="hushdoc-{key}" autoplay style="display:none"
+               src="data:audio/wav;base64,{b64}#k={key}"></audio>
+        """,
+        height=0,
+    )
+
+
 def _save_uploaded_files(uploaded_files) -> List[Path]:
     paths: List[Path] = []
     for f in uploaded_files:
@@ -139,14 +162,15 @@ def _ingest_and_index(paths: List[Path]) -> tuple[int, int]:
 # Sidebar — ingestion controls
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.header("\U0001F4C2 Documents")
+    # ── Documents
+    st.subheader("\U0001F4C2 Documents")
 
     uploaded = st.file_uploader(
         "Upload PDF(s)",
         type=["pdf"],
         accept_multiple_files=True,
+        label_visibility="collapsed",
     )
-
     replace_index = st.checkbox(
         "Replace existing index on upload",
         value=True,
@@ -154,7 +178,6 @@ with st.sidebar:
              "queries only see the newly uploaded PDFs. Uncheck to add "
              "new PDFs alongside what's already indexed.",
     )
-
     col_a, col_b = st.columns(2)
     with col_a:
         ingest_clicked = st.button(
@@ -164,13 +187,13 @@ with st.sidebar:
             use_container_width=True,
         )
     with col_b:
-        clear_chat_clicked = st.button(
-            "Clear Chat",
-            use_container_width=True,
-        )
+        clear_chat_clicked = st.button("Clear Chat", use_container_width=True)
 
     if ingest_clicked and uploaded:
-        with st.status("Parsing PDFs with Docling and indexing into Chroma...", expanded=True) as status:
+        with st.status(
+            "Parsing PDFs with Docling and indexing into Chroma...",
+            expanded=True,
+        ) as status:
             try:
                 if replace_index:
                     st.write("Wiping existing vector store...")
@@ -181,8 +204,8 @@ with st.sidebar:
                 st.write(f"Saved {len(paths)} file(s) to {UPLOAD_DIR}.")
                 ok, chunks = _ingest_and_index(paths)
                 status.update(
-                    label=f"Indexed {ok}/{len(paths)} file(s) ({chunks} chunks). "
-                          f"Doc-level summaries generated.",
+                    label=f"Indexed {ok}/{len(paths)} file(s) "
+                          f"({chunks} chunks, summaries generated).",
                     state="complete",
                 )
             except Exception as exc:
@@ -194,18 +217,60 @@ with st.sidebar:
         chain.reset_session(st.session_state.session_id)
         st.session_state.messages = []
         st.session_state.session_id = str(uuid.uuid4())
-        st.success("Chat cleared.")
+        st.toast("Chat cleared.", icon="🧹")
 
-    st.divider()
+    try:
+        store = get_vector_store()
+        store_count = store.count()
+    except Exception:
+        store = None
+        store_count = -1
+    st.caption(f"Vector store: **{store_count}** chunks")
 
-    # ── Voice mode (default OFF). Toggling on reveals a microphone widget
-    # under the chat and auto-plays the answer audio after streaming.
+    # Wipe-everything button — separate from "Clear Chat" to avoid accidents.
+    if store is not None and store_count > 0:
+        if st.button(
+            "\U0001F5D1 Clear all documents",
+            use_container_width=True,
+            help="Permanently delete every chunk + summary from the vector store.",
+        ):
+            store.reset()
+            doc_summaries.clear_all()
+            st.session_state.indexed_files = []
+            st.toast("Vector store wiped.", icon="🗑")
+            st.rerun()
+
+    # ── Search scope (only shown when there's something to scope to)
+    indexed_files = _list_indexed_filenames()
+    if indexed_files:
+        st.subheader("\U0001F50D Search scope")
+        if "scope" not in st.session_state:
+            st.session_state.scope = list(indexed_files)
+        else:
+            # Drop any selections that no longer exist (file was unindexed).
+            st.session_state.scope = [
+                f for f in st.session_state.scope if f in indexed_files
+            ]
+
+        st.session_state.scope = st.multiselect(
+            f"In {len(indexed_files)} indexed PDF(s)",
+            options=indexed_files,
+            default=st.session_state.scope,
+            help="Restrict each query to specific PDFs. Leave empty or select "
+                 "all to search across the whole vector store.",
+            label_visibility="collapsed",
+        )
+    else:
+        st.session_state.scope = []
+
+    # ── Voice mode (default OFF)
+    st.subheader("\U0001F3A4 Voice")
     voice_mode = st.toggle(
-        "\U0001F3A4 Voice mode",
+        "Voice mode",
         value=st.session_state.get("voice_mode", False),
         help=(
-            "Speak your question with the microphone widget; the answer "
-            "auto-plays after streaming completes. English-only for now."
+            "Speak your question with the inline mic button. The answer "
+            "auto-plays after streaming and a 🔊 replay icon stays beside it."
         ),
     )
     st.session_state.voice_mode = voice_mode
@@ -215,63 +280,22 @@ with st.sidebar:
             "(Whisper-base.en in, Kokoro-82M out)."
         )
 
-    st.divider()
-
-    try:
-        store = get_vector_store()
-        store_count = store.count()
-    except Exception:
-        store = None
-        store_count = -1
-    st.caption(f"Vector store size: **{store_count}** chunks")
-
-    # Wipe-everything button — separate from "Clear Chat" to avoid accidents.
-    if store is not None and store_count > 0:
-        if st.button("\U0001F5D1 Clear all documents", use_container_width=True,
-                     help="Permanently delete every chunk + summary from the vector store."):
-            store.reset()
-            doc_summaries.clear_all()
-            st.session_state.indexed_files = []
-            st.success("Vector store wiped.")
-            st.rerun()
-
-    # Per-PDF scope selector. Without this, retrieval pools chunks from
-    # every indexed doc and mixes facts across them ("cross-talk"). The
-    # multiselect lets the user constrain each turn to specific files.
-    indexed_files = _list_indexed_filenames()
-    if indexed_files:
-        if "scope" not in st.session_state:
-            # Default: search across everything that's indexed.
-            st.session_state.scope = list(indexed_files)
-        else:
-            # Drop any selections that no longer exist (file was unindexed).
-            st.session_state.scope = [
-                f for f in st.session_state.scope if f in indexed_files
-            ]
-
-        st.session_state.scope = st.multiselect(
-            f"Search in ({len(indexed_files)} indexed)",
-            options=indexed_files,
-            default=st.session_state.scope,
-            help="Restrict each query to specific PDFs. Leave empty or "
-                 "select all to search across the whole vector store.",
-        )
-    else:
-        st.session_state.scope = []
-
 
 # ---------------------------------------------------------------------------
 # Main pane — chat
 # ---------------------------------------------------------------------------
-st.title("\U0001F4DA Local PDF RAG Assistant")
-st.caption("Offline RAG over your PDFs — Docling + ChromaDB + llama.cpp + LangChain.")
+st.title("\U0001F910 Hushdoc")
+st.caption(
+    "A local-only PDF assistant that keeps every word between you and your machine."
+)
 
-# Render past messages.
-for msg in st.session_state.messages:
+# Render past messages. Each assistant message that has cached TTS audio
+# gets a 🔊 replay icon next to its source-citation row.
+for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg.get("sources"):
-            with st.expander("Sources"):
+            with st.expander(msg.get("sources_label") or "Sources"):
                 for s in msg["sources"]:
                     meta = s.get("metadata", {})
                     label = f"**{meta.get('filename', 'unknown')}** — p.{meta.get('page', '?')}"
@@ -279,35 +303,56 @@ for msg in st.session_state.messages:
                         label += f" — {meta['headings']}"
                     st.markdown(label)
                     st.markdown(f"> {s.get('snippet', '')}")
+        if msg.get("audio_b64"):
+            if st.button("🔊", key=f"replay_{i}", help="Replay audio"):
+                st.session_state["__pending_audio_b64__"] = msg["audio_b64"]
+                st.session_state["__pending_audio_key__"] = f"replay_{i}_{uuid.uuid4().hex[:6]}"
+                st.rerun()
 
-# Tiny scope indicator so users understand what each query will search.
+# Scope indicator + (when voice mode is on) inline mic. Both sit
+# immediately above the chat input so the mic visually belongs to it.
 _indexed = _list_indexed_filenames()
 _selected = st.session_state.get("scope") or []
 if _indexed:
     if not _selected or set(_selected) == set(_indexed):
-        st.caption(f"\U0001F50D Searching: **all {len(_indexed)} indexed document(s)**")
+        scope_msg = f"\U0001F50D Searching: **all {len(_indexed)} indexed document(s)**"
     elif len(_selected) == 1:
-        st.caption(f"\U0001F50D Searching only: **{_selected[0]}**")
+        scope_msg = f"\U0001F50D Searching only: **{_selected[0]}**"
     else:
-        st.caption(f"\U0001F50D Searching: **{len(_selected)} of {len(_indexed)} document(s)**")
+        scope_msg = f"\U0001F50D Searching: **{len(_selected)} of {len(_indexed)} document(s)**"
 else:
-    st.caption("\U0001F4C2 No documents indexed yet — upload a PDF to start.")
+    scope_msg = "\U0001F4C2 No documents indexed yet — upload a PDF to start."
 
-# Voice input widget (only when voice mode is on). Recorded audio is
-# transcribed with Whisper-base.en and queued as the next user prompt.
 if st.session_state.get("voice_mode"):
-    audio_in = st.audio_input("\U0001F3A4 Speak your question (English only)")
-    if audio_in is not None:
-        # st.audio_input returns the same UploadedFile across reruns until
-        # the user records again. Track the last-handled file_id to avoid
-        # re-transcribing on every script rerun.
-        file_id = getattr(audio_in, "file_id", None) or audio_in.name
-        if st.session_state.get("__last_audio_file_id__") != file_id:
+    # Mic icon sits in a narrow column on the left; the scope caption
+    # fills the rest of the row so the mic visually anchors to the
+    # chat input directly below.
+    from audio_recorder_streamlit import audio_recorder
+    col_mic, col_msg = st.columns([1, 11])
+    with col_mic:
+        audio_bytes = audio_recorder(
+            text="",
+            icon_name="microphone",
+            icon_size="2x",
+            recording_color="#e8b62c",
+            neutral_color="#6aa36f",
+            pause_threshold=2.0,   # auto-stop after 2 s of silence
+            sample_rate=16000,
+            key="hushdoc_mic",
+        )
+    with col_msg:
+        st.caption(scope_msg + " — speak then pause to send.")
+    if audio_bytes:
+        # audio_recorder returns the same bytes across reruns until the
+        # user records again. Hash them to fire transcription only once.
+        import hashlib
+        audio_id = hashlib.sha1(audio_bytes).hexdigest()
+        if st.session_state.get("__last_audio_id__") != audio_id:
             try:
                 from voice import transcribe
                 with st.spinner("Transcribing..."):
-                    text = transcribe(audio_in.getvalue())
-                st.session_state["__last_audio_file_id__"] = file_id
+                    text = transcribe(audio_bytes)
+                st.session_state["__last_audio_id__"] = audio_id
                 if text:
                     st.session_state["__pending_prompt__"] = text
                     st.rerun()
@@ -316,8 +361,10 @@ if st.session_state.get("voice_mode"):
             except Exception as exc:
                 logger.exception("Voice input failed")
                 st.error(f"Voice input failed: {exc}")
+else:
+    st.caption(scope_msg)
 
-# Input. A pending voice-transcribed prompt is replayed as if the user typed it.
+# Input. A pending voice-transcribed prompt is replayed as if typed.
 prompt = st.chat_input("Ask a question about your PDFs...")
 if not prompt and st.session_state.get("__pending_prompt__"):
     prompt = st.session_state.pop("__pending_prompt__")
@@ -390,13 +437,14 @@ if prompt:
         all_sources = result.get("all_source_documents", cited_sources)
 
         sources_payload = []
+        sources_label = "Sources"
         if cited_sources:
-            label = (
+            sources_label = (
                 f"Sources cited ({len(cited_sources)})"
                 if len(cited_sources) < len(all_sources)
                 else "Sources"
             )
-            with st.expander(label):
+            with st.expander(sources_label):
                 if len(cited_sources) < len(all_sources):
                     st.caption(
                         f"Showing only the {len(cited_sources)} excerpts the "
@@ -412,24 +460,23 @@ if prompt:
                     st.markdown(head)
                     st.markdown(f"> {snippet}")
                     sources_payload.append({"metadata": meta, "snippet": snippet})
+                # Standalone-query debug info: folded inside Sources rather
+                # than a second top-level expander, to keep each turn tidy.
+                if not result.get("chitchat"):
+                    st.divider()
+                    st.caption("Standalone search query (debug):")
+                    st.code(
+                        result.get("standalone_question", ""),
+                        language=None,
+                    )
 
-        # Hide the standalone-query debug expander on chitchat turns.
-        if not result.get("chitchat"):
-            with st.expander("Standalone search query"):
-                st.code(result.get("standalone_question", ""))
-
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": answer,
-            "sources": sources_payload,
-        })
-
-        # Voice output: synthesize once after streaming completes and
-        # auto-play. Only English (Kokoro-82M is English-only); Chinese
-        # answers stay text-only with a small notice. We can't truly
-        # stream TTS during token generation in pure Streamlit (no API
-        # for sequential audio playback), so this is a single one-shot
-        # play of the full answer.
+        # Voice output: synthesize once after streaming completes. We use
+        # an invisible HTML5 <audio autoplay> via components.html instead
+        # of st.audio so the user doesn't see Streamlit's full-width
+        # progress bar after every answer. The bytes are cached on the
+        # message so a 🔊 replay icon next to the answer can re-play the
+        # same audio without re-running the model.
+        audio_b64: str = ""
         if st.session_state.get("voice_mode") and answer:
             from llm_chain import detect_language
             if detect_language(answer) == "en":
@@ -438,11 +485,43 @@ if prompt:
                     with st.spinner("\U0001F50A Generating audio..."):
                         audio_bytes = synthesize(answer)
                     if audio_bytes:
-                        st.audio(audio_bytes, format="audio/wav", autoplay=True)
+                        audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+                        # Autoplay invisibly this turn.
+                        _autoplay_audio(audio_bytes, key=f"new_{uuid.uuid4().hex[:6]}")
+                        # Persistent replay icon for the just-rendered message
+                        # (the message-loop render of the same turn on the
+                        # next rerun will show another one keyed by index).
+                        if st.button(
+                            "🔊", key=f"replay_live_{uuid.uuid4().hex[:6]}",
+                            help="Replay audio",
+                        ):
+                            st.session_state["__pending_audio_b64__"] = audio_b64
+                            st.session_state["__pending_audio_key__"] = (
+                                f"replay_live_{uuid.uuid4().hex[:6]}"
+                            )
+                            st.rerun()
                 except Exception:
                     logger.exception("Voice output failed")
             else:
                 st.caption(
-                    "\U0001F507 Voice output skipped — Kokoro-82M is English-only "
-                    "for now."
+                    "\U0001F507 Voice output skipped — Kokoro-82M is English-only."
                 )
+
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "sources": sources_payload,
+            "sources_label": sources_label,
+            "audio_b64": audio_b64,
+        })
+
+
+# Handle a 🔊 replay click queued from the message-render loop. Renders
+# the invisible autoplay HTML one final time at end of script.
+_pending_b64 = st.session_state.pop("__pending_audio_b64__", None)
+_pending_key = st.session_state.pop("__pending_audio_key__", None)
+if _pending_b64 and _pending_key:
+    try:
+        _autoplay_audio(base64.b64decode(_pending_b64), key=_pending_key)
+    except Exception:
+        logger.exception("Replay autoplay failed")

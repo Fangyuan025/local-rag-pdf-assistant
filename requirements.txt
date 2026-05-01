@@ -33,6 +33,10 @@ streamlit>=1.36.0
 kokoro>=0.9.4
 misaki[en]>=0.9.4            # English G2P backend used by Kokoro
 soundfile>=0.12.0            # WAV decode (Whisper input) + encode (Kokoro output)
+# Inline mic button with auto-stop on silence (pause_threshold).
+# Note: this package's metadata pins altair<5; harmless because we don't
+# use st.altair_chart anywhere.
+audio-recorder-streamlit>=0.0.10
 
 # --- Utilities ---
 pydantic>=2.7.0
