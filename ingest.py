@@ -40,7 +40,13 @@ logger = logging.getLogger("ingest")
 # Configuration
 # ---------------------------------------------------------------------------
 DEFAULT_DATA_DIR = Path("./data")
-SUPPORTED_SUFFIXES = {".pdf"}
+# Docling auto-detects format from extension. PDFs go through the layout
+# pipeline; image suffixes go through the image pipeline which OCRs the
+# page via RapidOCR (already cached locally as a Docling dep). The chunker
+# downstream is format-agnostic - it just sees text + structure.
+PDF_SUFFIXES = {".pdf"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+SUPPORTED_SUFFIXES = PDF_SUFFIXES | IMAGE_SUFFIXES
 
 
 @dataclass
@@ -107,16 +113,20 @@ class PDFIngestor:
 
     # ------------------------------------------------------------------ utils
     @staticmethod
-    def _validate_path(pdf_path: Path) -> Path:
-        pdf_path = Path(pdf_path).expanduser().resolve()
-        if not pdf_path.exists():
-            raise FileNotFoundError(f"PDF not found: {pdf_path}")
-        if pdf_path.suffix.lower() not in SUPPORTED_SUFFIXES:
+    def _validate_path(src_path: Path) -> Path:
+        src_path = Path(src_path).expanduser().resolve()
+        if not src_path.exists():
+            raise FileNotFoundError(f"File not found: {src_path}")
+        if src_path.suffix.lower() not in SUPPORTED_SUFFIXES:
             raise ValueError(
-                f"Unsupported file type '{pdf_path.suffix}'. "
-                f"Expected one of {SUPPORTED_SUFFIXES}."
+                f"Unsupported file type '{src_path.suffix}'. "
+                f"Expected one of {sorted(SUPPORTED_SUFFIXES)}."
             )
-        return pdf_path
+        return src_path
+
+    @staticmethod
+    def _is_image(path: Path) -> bool:
+        return path.suffix.lower() in IMAGE_SUFFIXES
 
     @staticmethod
     def _clean_text(text: str) -> str:
@@ -125,28 +135,34 @@ class PDFIngestor:
         return text
 
     # --------------------------------------------------------------- main API
-    def ingest(self, pdf_path: str | Path) -> IngestionResult:
+    def ingest(self, src_path: str | Path) -> IngestionResult:
         """
-        Convert a single PDF into Markdown + a list of LangChain Documents.
+        Convert a single PDF or document image (JPG/PNG/TIFF/BMP) into
+        Markdown + a list of LangChain Documents. Images go through
+        Docling's image pipeline which runs OCR via RapidOCR.
 
         Returns
         -------
         IngestionResult
             Populated with markdown and chunked Documents.
         """
-        pdf_path = self._validate_path(Path(pdf_path))
-        logger.info("Parsing PDF with Docling: %s", pdf_path.name)
+        src_path = self._validate_path(Path(src_path))
+        kind = "image (OCR)" if self._is_image(src_path) else "PDF"
+        logger.info("Parsing %s with Docling: %s", kind, src_path.name)
 
         try:
-            conversion = self._converter.convert(str(pdf_path))
+            conversion = self._converter.convert(str(src_path))
         except Exception as exc:
-            logger.exception("Docling failed to parse %s", pdf_path)
-            raise RuntimeError(f"Docling parse error for {pdf_path}") from exc
+            logger.exception("Docling failed to parse %s", src_path)
+            raise RuntimeError(f"Docling parse error for {src_path}") from exc
 
         docling_doc = conversion.document
 
         # Markdown preserves tables as pipe-tables and formulas as LaTeX,
-        # which is ideal for the LLM to reason over downstream.
+        # which is ideal for the LLM to reason over downstream. For images
+        # the markdown is the OCR text, structured by Docling's layout
+        # detector (so single-column scans become paragraphs, multi-column
+        # become tables, etc.).
         try:
             markdown = docling_doc.export_to_markdown()
         except Exception:
@@ -156,17 +172,17 @@ class PDFIngestor:
         markdown = self._clean_text(markdown)
 
         # Layout-aware chunking using Docling's hierarchical chunker.
-        documents = self._chunk_to_documents(docling_doc, source=pdf_path)
+        documents = self._chunk_to_documents(docling_doc, source=src_path)
 
         logger.info(
             "Extracted %d chunks from %s (markdown length: %d chars)",
             len(documents),
-            pdf_path.name,
+            src_path.name,
             len(markdown),
         )
 
         return IngestionResult(
-            source_path=pdf_path,
+            source_path=src_path,
             markdown=markdown,
             documents=documents,
         )
@@ -189,10 +205,14 @@ class PDFIngestor:
         if not directory.is_dir():
             raise NotADirectoryError(f"Not a directory: {directory}")
 
-        pattern = "**/*.pdf" if recursive else "*.pdf"
-        pdfs = sorted(directory.glob(pattern))
-        logger.info("Found %d PDF(s) under %s", len(pdfs), directory)
-        return self.ingest_many(pdfs)
+        # Glob every supported extension (case-insensitive on Windows).
+        files: List[Path] = []
+        for suffix in SUPPORTED_SUFFIXES:
+            pattern = f"**/*{suffix}" if recursive else f"*{suffix}"
+            files.extend(directory.glob(pattern))
+        files = sorted(set(files))
+        logger.info("Found %d ingestible file(s) under %s", len(files), directory)
+        return self.ingest_many(files)
 
     # ----------------------------------------------------------------- chunks
     def _chunk_to_documents(
