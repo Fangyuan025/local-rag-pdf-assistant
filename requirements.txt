@@ -26,6 +26,14 @@ datasets>=2.20.0
 # --- Frontend ---
 streamlit>=1.36.0
 
+# --- Optional: voice mode (English only) ---
+# Whisper-base.en is loaded via the existing transformers install (already
+# pulled in transitively by sentence-transformers). Kokoro-82M needs its own
+# package + soundfile for WAV I/O. Both run on CPU; lazy-loaded on first use.
+kokoro>=0.9.4
+misaki[en]>=0.9.4            # English G2P backend used by Kokoro
+soundfile>=0.12.0            # WAV decode (Whisper input) + encode (Kokoro output)
+
 # --- Utilities ---
 pydantic>=2.7.0
 pandas>=2.2.0

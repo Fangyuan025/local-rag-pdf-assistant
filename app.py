@@ -198,6 +198,25 @@ with st.sidebar:
 
     st.divider()
 
+    # ── Voice mode (default OFF). Toggling on reveals a microphone widget
+    # under the chat and auto-plays the answer audio after streaming.
+    voice_mode = st.toggle(
+        "\U0001F3A4 Voice mode",
+        value=st.session_state.get("voice_mode", False),
+        help=(
+            "Speak your question with the microphone widget; the answer "
+            "auto-plays after streaming completes. English-only for now."
+        ),
+    )
+    st.session_state.voice_mode = voice_mode
+    if voice_mode:
+        st.caption(
+            "\U0001F310 Voice features are English-only for now "
+            "(Whisper-base.en in, Kokoro-82M out)."
+        )
+
+    st.divider()
+
     try:
         store = get_vector_store()
         store_count = store.count()
@@ -274,8 +293,34 @@ if _indexed:
 else:
     st.caption("\U0001F4C2 No documents indexed yet — upload a PDF to start.")
 
-# Input.
+# Voice input widget (only when voice mode is on). Recorded audio is
+# transcribed with Whisper-base.en and queued as the next user prompt.
+if st.session_state.get("voice_mode"):
+    audio_in = st.audio_input("\U0001F3A4 Speak your question (English only)")
+    if audio_in is not None:
+        # st.audio_input returns the same UploadedFile across reruns until
+        # the user records again. Track the last-handled file_id to avoid
+        # re-transcribing on every script rerun.
+        file_id = getattr(audio_in, "file_id", None) or audio_in.name
+        if st.session_state.get("__last_audio_file_id__") != file_id:
+            try:
+                from voice import transcribe
+                with st.spinner("Transcribing..."):
+                    text = transcribe(audio_in.getvalue())
+                st.session_state["__last_audio_file_id__"] = file_id
+                if text:
+                    st.session_state["__pending_prompt__"] = text
+                    st.rerun()
+                else:
+                    st.warning("Could not transcribe — try recording again.")
+            except Exception as exc:
+                logger.exception("Voice input failed")
+                st.error(f"Voice input failed: {exc}")
+
+# Input. A pending voice-transcribed prompt is replayed as if the user typed it.
 prompt = st.chat_input("Ask a question about your PDFs...")
+if not prompt and st.session_state.get("__pending_prompt__"):
+    prompt = st.session_state.pop("__pending_prompt__")
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -378,3 +423,26 @@ if prompt:
             "content": answer,
             "sources": sources_payload,
         })
+
+        # Voice output: synthesize once after streaming completes and
+        # auto-play. Only English (Kokoro-82M is English-only); Chinese
+        # answers stay text-only with a small notice. We can't truly
+        # stream TTS during token generation in pure Streamlit (no API
+        # for sequential audio playback), so this is a single one-shot
+        # play of the full answer.
+        if st.session_state.get("voice_mode") and answer:
+            from llm_chain import detect_language
+            if detect_language(answer) == "en":
+                try:
+                    from voice import synthesize
+                    with st.spinner("\U0001F50A Generating audio..."):
+                        audio_bytes = synthesize(answer)
+                    if audio_bytes:
+                        st.audio(audio_bytes, format="audio/wav", autoplay=True)
+                except Exception:
+                    logger.exception("Voice output failed")
+            else:
+                st.caption(
+                    "\U0001F507 Voice output skipped — Kokoro-82M is English-only "
+                    "for now."
+                )

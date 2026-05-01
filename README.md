@@ -1,12 +1,20 @@
-# Local PDF RAG Assistant
+# 🤫 Hushdoc
 
-A fully offline, GPU-accelerated, stateful RAG assistant for PDFs. Parses
-documents with **IBM Docling** (preserves tables, code, math), embeds with
-**sentence-transformers**, persists in **ChromaDB**, and answers via a local
-**llama.cpp** server with any GGUF model. Streamlit UI on top with
-**token-by-token streaming**, multi-document scope filtering, automatic
-**Chinese / English language matching**, and a citation-anchored sources
-view. Ragas evaluation on the side. No cloud, no API keys.
+> **A local-only PDF assistant that keeps every word between you and your machine.**
+
+Privacy-first, fully offline, GPU-accelerated, stateful RAG over your own
+PDFs. Nothing about your documents — not the file, not the chunks, not your
+questions, not the answers — ever leaves your computer. The only network
+call is the one-time HuggingFace download of the embedding / ASR / TTS
+models, after which you can run completely air-gapped.
+
+Built on **IBM Docling** (preserves tables, code, LaTeX math),
+**sentence-transformers** + **ChromaDB** (persistent local vector store),
+and a local **llama.cpp** server with any GGUF model. Streamlit UI on top
+with **token-by-token streaming**, multi-document scope filtering,
+automatic **Chinese / English language matching**, citation-anchored
+sources, and an **optional voice mode** (Whisper for speech-in, Kokoro for
+speech-out). Ragas evaluation on the side. No cloud, no API keys.
 
 ## Architecture
 
@@ -64,8 +72,9 @@ Per-turn flow inside `llm_chain.py`:
 | `llama_server.py` | Lifecycle manager for the standalone `llama-server.exe` (subprocess + `/health` polling + auto-shutdown). |
 | `llm_chain.py` | `LLMConfig`, `RAGChain` (streaming, memory, language detection, standalone-question rewriter with follow-up boost, chitchat short-circuit, citation parser), `ChatOpenAI` client pointed at the local server. |
 | `doc_summaries.py` | Per-PDF 2–3 sentence summary cache (`chroma_db/summaries.json`). Generated once at ingest, injected into the answer prompt as a "Documents in scope" overview. |
+| `voice.py` | Optional CPU-only voice mode. Whisper-base.en for speech-in, Kokoro-82M for speech-out. English only for now. |
 | `evaluate.py` | Offline Ragas evaluation. Computes Context Precision / Faithfulness / Answer Relevancy with the LOCAL judge LLM. Writes JSON+CSV to `eval_results/`. |
-| `app.py` | Streamlit chat UI: upload, replace-or-append, clear-all, multi-doc scope multiselect, live scope indicator, streaming answers, citation-filtered sources. |
+| `app.py` | Streamlit chat UI: upload, replace-or-append, clear-all, multi-doc scope multiselect, live scope indicator, streaming answers, citation-filtered sources, optional voice mode. |
 | `smoke_test.py` | End-to-end smoke test (3 questions against the indexed PDFs). |
 | `eval_dataset.json` | Sample test set for `evaluate.py`. |
 
@@ -142,6 +151,10 @@ Sidebar:
 - **🗑 Clear all documents** — manual nuke (chunks + summaries).
 - **Search in (N indexed)** — multi-select to restrict each query to a
   subset of indexed PDFs. Empty or all-selected ≡ "search everything".
+- **🎤 Voice mode** — off by default. When enabled, a microphone widget
+  appears above the chat input and the answer is auto-played as audio
+  after streaming completes. **English only for now**
+  (Whisper-base.en in, Kokoro-82M out, both CPU).
 
 Main pane:
 - A small caption above the input shows the live retrieval scope.
@@ -293,6 +306,19 @@ you", "Howdy", etc.). These bypass retrieval and hit a friendly
 conversational prompt instead. Ambiguous short utterances ("why?",
 "为什么？") are NOT treated as chitchat when there is prior chat
 history — they go through the RAG path so the rewriter can expand them.
+
+**Voice mode (optional, English only).** A sidebar toggle (default OFF)
+adds a `st.audio_input` microphone widget above the chat. Recordings are
+transcribed on CPU with **openai/whisper-base.en**; the transcript is
+queued as the next user prompt and goes through the normal chain. After
+the answer streams in, **hexgrad/Kokoro-82M** synthesizes a single WAV
+that auto-plays. Both models are loaded lazily on first use, run on the
+CPU (the GPU stays reserved for `llama-server`), and are skipped
+entirely when voice mode is off. Streamlit doesn't expose a way to
+queue sequential audio playback during streaming, so voice playback is
+a single one-shot at the end of the answer rather than mid-token.
+Chinese and other non-English answers display the text but skip the
+TTS step with a small notice.
 
 ## License
 
