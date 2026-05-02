@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   QueryClient,
   QueryClientProvider,
@@ -6,7 +6,8 @@ import {
 } from "@tanstack/react-query"
 import { AlertTriangle, Loader2, Moon, ShieldCheck, Sun } from "lucide-react"
 
-import { ChatPane } from "@/components/ChatPane"
+import { ChatPane, type ChatPaneHandle } from "@/components/ChatPane"
+import { Sidebar } from "@/components/Sidebar"
 import { Button } from "@/components/ui/button"
 import { apiHealth } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -87,7 +88,8 @@ function Shell() {
     document.documentElement.classList.toggle("dark", dark)
   }, [dark])
 
-  // One stable session id per browser tab. Cleared by Clear-chat in P5+.
+  // One stable session id per browser tab. "New chat" in the sidebar
+  // resets the chain's server-side memory but keeps this id.
   const sessionId = useMemo(() => {
     const k = "hushdoc-session-id"
     const existing = sessionStorage.getItem(k)
@@ -96,6 +98,12 @@ function Shell() {
     sessionStorage.setItem(k, fresh)
     return fresh
   }, [])
+
+  // Lifted state: the sidebar reports the current scope; the chat consumes it.
+  // useState's referential identity is stable, so passing setScope directly
+  // to the sidebar avoids triggering a new effect each render.
+  const [scope, setScope] = useState<string[] | null>(null)
+  const chatRef = useRef<ChatPaneHandle>(null)
 
   return (
     <div className="flex h-full flex-col">
@@ -121,14 +129,14 @@ function Shell() {
         </div>
       </header>
 
-      <main className="grid min-h-0 flex-1 grid-cols-1 md:grid-cols-[16rem_1fr]">
-        <aside className="hidden border-r p-4 text-xs text-muted-foreground md:block">
-          <div className="rounded-md border border-dashed p-3">
-            Sidebar (documents · scope · voice) lands in P5–P6.
-          </div>
-        </aside>
-
-        <ChatPane sessionId={sessionId} />
+      <main className="flex min-h-0 flex-1">
+        <Sidebar
+          onClearChat={() => chatRef.current?.clear()}
+          onScopeChange={setScope}
+        />
+        <div className="flex min-w-0 flex-1">
+          <ChatPane ref={chatRef} sessionId={sessionId} scope={scope} />
+        </div>
       </main>
     </div>
   )

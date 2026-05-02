@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react"
+import { forwardRef, useEffect, useImperativeHandle, useRef } from "react"
 import { Sparkles } from "lucide-react"
 
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -12,39 +12,47 @@ interface ChatPaneProps {
   scope?: string[] | null
 }
 
-export function ChatPane({ sessionId, scope }: ChatPaneProps) {
-  const { messages, send, stop, streaming, error } = useChat({
-    sessionId,
-    scope,
-  })
-  const bottomRef = useRef<HTMLDivElement>(null)
-
-  // Pin the scrollbar to bottom while streaming so new tokens stay in view.
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" })
-  }, [messages])
-
-  return (
-    <div className="flex h-full min-h-0 flex-col">
-      <ScrollArea className="flex-1">
-        <div className="mx-auto w-full max-w-3xl space-y-6 px-4 py-6">
-          {messages.length === 0 ? (
-            <EmptyState />
-          ) : (
-            messages.map((msg) => <ChatMessage key={msg.id} msg={msg} />)
-          )}
-          {error && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-              {error}
-            </div>
-          )}
-          <div ref={bottomRef} />
-        </div>
-      </ScrollArea>
-      <ChatInput streaming={streaming} onSend={send} onStop={stop} />
-    </div>
-  )
+export interface ChatPaneHandle {
+  clear: () => void
 }
+
+export const ChatPane = forwardRef<ChatPaneHandle, ChatPaneProps>(
+  function ChatPane({ sessionId, scope }, ref) {
+    const { messages, send, stop, clear, streaming, error } = useChat({
+      sessionId,
+      scope,
+    })
+    const bottomRef = useRef<HTMLDivElement>(null)
+
+    // Pin the scrollbar to bottom while streaming so new tokens stay in view.
+    useEffect(() => {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" })
+    }, [messages])
+
+    useImperativeHandle(ref, () => ({ clear }), [clear])
+
+    return (
+      <div className="flex h-full min-h-0 flex-1 flex-col">
+        <ScrollArea className="flex-1">
+          <div className="mx-auto w-full max-w-3xl space-y-6 px-4 py-6">
+            {messages.length === 0 ? (
+              <EmptyState />
+            ) : (
+              messages.map((msg) => <ChatMessage key={msg.id} msg={msg} />)
+            )}
+            {error && (
+              <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                {error}
+              </div>
+            )}
+            <div ref={bottomRef} />
+          </div>
+        </ScrollArea>
+        <ChatInput streaming={streaming} onSend={send} onStop={stop} />
+      </div>
+    )
+  },
+)
 
 function EmptyState() {
   return (
