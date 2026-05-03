@@ -1,15 +1,16 @@
 import {
   forwardRef,
   useCallback,
-  useEffect,
   useImperativeHandle,
   useRef,
 } from "react"
-import { Sparkles } from "lucide-react"
+import { ArrowDown, Sparkles } from "lucide-react"
 
 import { MicButton } from "@/components/MicButton"
+import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useChat } from "@/hooks/useChat"
+import { useStickyBottom } from "@/hooks/useStickyBottom"
 import type { useVoice } from "@/hooks/useVoice"
 import type { ChatMessage as Msg } from "@/types"
 
@@ -24,6 +25,8 @@ interface ChatPaneProps {
 
 export interface ChatPaneHandle {
   clear: () => void
+  focusInput: () => void
+  cancel: () => void
 }
 
 export const ChatPane = forwardRef<ChatPaneHandle, ChatPaneProps>(
@@ -54,12 +57,22 @@ export const ChatPane = forwardRef<ChatPaneHandle, ChatPaneProps>(
     )
     attachAudioRef.current = patchMessage
 
-    const bottomRef = useRef<HTMLDivElement>(null)
-    useEffect(() => {
-      bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" })
-    }, [messages])
+    const { scrollRef, bottomRef, autoFollow, jumpToBottom } =
+      useStickyBottom<HTMLDivElement>(messages)
 
-    useImperativeHandle(ref, () => ({ clear }), [clear])
+    const inputRef = useRef<HTMLTextAreaElement>(null)
+    useImperativeHandle(
+      ref,
+      () => ({
+        clear,
+        focusInput: () => inputRef.current?.focus(),
+        cancel: () => {
+          if (voice.state !== "idle") voice.cancel()
+          else if (streaming) stop()
+        },
+      }),
+      [clear, voice, streaming, stop],
+    )
 
     // Voice input — once VAD stops + transcribe returns, send immediately.
     const startVoice = useCallback(async () => {
@@ -68,8 +81,8 @@ export const ChatPane = forwardRef<ChatPaneHandle, ChatPaneProps>(
     }, [voice, send])
 
     return (
-      <div className="flex h-full min-h-0 flex-1 flex-col">
-        <ScrollArea className="flex-1">
+      <div className="relative flex h-full min-h-0 flex-1 flex-col">
+        <ScrollArea ref={scrollRef} className="flex-1">
           <div className="mx-auto w-full max-w-3xl space-y-6 px-4 py-6">
             {messages.length === 0 ? (
               <EmptyState />
@@ -86,7 +99,26 @@ export const ChatPane = forwardRef<ChatPaneHandle, ChatPaneProps>(
             <div ref={bottomRef} />
           </div>
         </ScrollArea>
+
+        {/* Floating "jump to bottom" pill, shown only when the user has
+            scrolled away from the live tail. */}
+        {!autoFollow && messages.length > 0 && (
+          <div className="pointer-events-none absolute inset-x-0 bottom-24 z-10 flex justify-center">
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              className="pointer-events-auto h-7 rounded-full px-3 text-xs shadow-md"
+              onClick={jumpToBottom}
+            >
+              <ArrowDown className="h-3 w-3" />
+              Jump to latest
+            </Button>
+          </div>
+        )}
+
         <ChatInput
+          ref={inputRef}
           streaming={streaming}
           onSend={send}
           onStop={stop}

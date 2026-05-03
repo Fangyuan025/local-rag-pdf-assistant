@@ -4,11 +4,21 @@ import {
   QueryClientProvider,
   useQuery,
 } from "@tanstack/react-query"
-import { AlertTriangle, Loader2, Moon, ShieldCheck, Sun } from "lucide-react"
+import {
+  AlertTriangle,
+  Loader2,
+  Menu,
+  Moon,
+  ShieldCheck,
+  Sun,
+} from "lucide-react"
+import { Toaster } from "sonner"
 
 import { ChatPane, type ChatPaneHandle } from "@/components/ChatPane"
-import { Sidebar } from "@/components/Sidebar"
+import { Sidebar, SidebarContent } from "@/components/Sidebar"
 import { Button } from "@/components/ui/button"
+import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet"
+import { useKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts"
 import { useVoice } from "@/hooks/useVoice"
 import { apiHealth } from "@/lib/api"
 import { cn } from "@/lib/utils"
@@ -89,8 +99,7 @@ function Shell() {
     document.documentElement.classList.toggle("dark", dark)
   }, [dark])
 
-  // One stable session id per browser tab. "New chat" in the sidebar
-  // resets the chain's server-side memory but keeps this id.
+  // One stable session id per browser tab.
   const sessionId = useMemo(() => {
     const k = "hushdoc-session-id"
     const existing = sessionStorage.getItem(k)
@@ -100,27 +109,54 @@ function Shell() {
     return fresh
   }, [])
 
-  // Lifted state: the sidebar reports the current scope; the chat consumes it.
-  // useState's referential identity is stable, so passing setScope directly
-  // to the sidebar avoids triggering a new effect each render.
+  // Lifted state.
   const [scope, setScope] = useState<string[] | null>(null)
   const chatRef = useRef<ChatPaneHandle>(null)
-
-  // Single voice instance shared between Sidebar (toggle), ChatInput
-  // (mic button), and ChatPane (post-stream synthesise+autoplay).
   const voice = useVoice()
+  const [drawerOpen, setDrawerOpen] = useState(false)
+
+  // Global keyboard shortcuts.
+  useKeyboardShortcuts({
+    onFocusInput: () => chatRef.current?.focusInput(),
+    onClearChat: () => chatRef.current?.clear(),
+    onEscape: () => chatRef.current?.cancel(),
+  })
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex shrink-0 items-center justify-between border-b px-5 py-2.5">
-        <div className="flex items-center gap-2.5">
+      <header className="flex shrink-0 items-center justify-between gap-2 border-b px-4 py-2.5 sm:px-5">
+        <div className="flex min-w-0 items-center gap-2.5">
+          {/* Hamburger — mobile only */}
+          <Sheet open={drawerOpen} onOpenChange={setDrawerOpen}>
+            <SheetTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                className="md:hidden"
+              >
+                <Menu className="h-4 w-4" />
+              </Button>
+            </SheetTrigger>
+            <SheetContent side="left" className="p-0">
+              <SidebarContent
+                onClearChat={() => {
+                  chatRef.current?.clear()
+                  setDrawerOpen(false)
+                }}
+                onScopeChange={setScope}
+                voice={voice}
+              />
+            </SheetContent>
+          </Sheet>
+
           <span className="text-xl">🤫</span>
           <h1 className="text-base font-semibold tracking-tight">Hushdoc</h1>
-          <span className="hidden text-xs text-muted-foreground sm:inline">
+          <span className="hidden truncate text-xs text-muted-foreground sm:inline">
             local-only PDF assistant
           </span>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex shrink-0 items-center gap-2 sm:gap-3">
           <HealthPill />
           <Button
             type="button"
@@ -157,6 +193,15 @@ export default function App() {
   return (
     <QueryClientProvider client={qc}>
       <Shell />
+      <Toaster
+        position="bottom-right"
+        toastOptions={{
+          classNames: {
+            toast:
+              "border bg-background text-foreground shadow-md rounded-md text-sm",
+          },
+        }}
+      />
     </QueryClientProvider>
   )
 }

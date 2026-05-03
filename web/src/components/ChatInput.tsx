@@ -1,4 +1,4 @@
-import { useState, type KeyboardEvent } from "react"
+import { forwardRef, useState, type KeyboardEvent } from "react"
 import { ArrowUp, Square } from "lucide-react"
 import TextareaAutosize from "react-textarea-autosize"
 
@@ -16,14 +16,18 @@ interface ChatInputProps {
 }
 
 /** Bottom-anchored textarea + send button. Enter sends, Shift+Enter newline. */
-export function ChatInput({
-  disabled,
-  streaming,
-  placeholder = "Ask anything about your PDFs…",
-  onSend,
-  onStop,
-  leftSlot,
-}: ChatInputProps) {
+export const ChatInput = forwardRef<HTMLTextAreaElement, ChatInputProps>(
+  function ChatInput(
+    {
+      disabled,
+      streaming,
+      placeholder = "Ask anything about your PDFs…",
+      onSend,
+      onStop,
+      leftSlot,
+    },
+    ref,
+  ) {
   const [value, setValue] = useState("")
 
   const submit = () => {
@@ -45,6 +49,7 @@ export function ChatInput({
       <div className="mx-auto flex max-w-3xl items-end gap-2 rounded-2xl border bg-card px-3 py-2 shadow-sm focus-within:ring-1 focus-within:ring-ring">
         {leftSlot}
         <TextareaAutosize
+          ref={ref}
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={onKey}
@@ -81,8 +86,9 @@ export function ChatInput({
       </div>
       <div className="mx-auto mt-1.5 max-w-3xl text-center text-[10px] text-muted-foreground/70">
         Hushdoc runs entirely on your machine. Press Enter to send,
-        Shift+Enter for newline.
+        Shift+Enter for newline · Cmd/Ctrl+K focus, Cmd/Ctrl+L new chat,
+        Esc to stop.
       </div>
     </div>
   )
-}
+})

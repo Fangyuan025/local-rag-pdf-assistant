@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react"
+import { toast } from "sonner"
 
 import { apiSynthesize, apiTranscribe } from "@/lib/api"
 import { isEnglish } from "@/lib/audio"
@@ -69,7 +70,18 @@ export function useVoice() {
       return text || null
     } catch (err) {
       if ((err as Error).name === "AbortError") return null
-      setError(err instanceof Error ? err.message : String(err))
+      const msg = err instanceof Error ? err.message : String(err)
+      setError(msg)
+      // Common case: user denied mic permission. Surface a friendlier note.
+      if (/permission|denied|NotAllowed/i.test(msg)) {
+        toast.error(
+          "Microphone access denied. Allow it in your browser to use voice mode.",
+        )
+      } else if (/no speech/i.test(msg)) {
+        toast.warning("Didn't hear anything — try again?")
+      } else {
+        toast.error(`Voice input failed: ${msg}`)
+      }
       return null
     } finally {
       setState("idle")
@@ -104,7 +116,9 @@ export function useVoice() {
         playUrl(url)
         return url
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
+        const msg = err instanceof Error ? err.message : String(err)
+        setError(msg)
+        toast.error(`TTS failed: ${msg}`)
         return null
       }
     },

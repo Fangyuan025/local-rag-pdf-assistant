@@ -4,6 +4,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query"
+import { toast } from "sonner"
 
 import { apiDeleteDocuments, apiListDocuments } from "@/lib/api"
 
@@ -39,7 +40,15 @@ export function useDocuments() {
 
   const del = useMutation({
     mutationFn: apiDeleteDocuments,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["documents"] }),
+    onSuccess: (data) => {
+      qc.invalidateQueries({ queryKey: ["documents"] })
+      toast.success(
+        data.was_count > 0
+          ? `Cleared ${data.was_count} chunks from the vector store.`
+          : "Vector store was already empty.",
+      )
+    },
+    onError: (err) => toast.error(`Wipe failed: ${err.message}`),
   })
 
   const [progress, setProgress] = useState<UploadProgress>(EMPTY_PROGRESS)
@@ -123,7 +132,21 @@ export function useDocuments() {
               ),
             }))
           } else if (ev === "all_done") {
+            const p = payload as {
+              succeeded: number
+              total: number
+              total_chunks: number
+            }
             setProgress((old) => ({ ...old, done: true }))
+            if (p.succeeded === p.total) {
+              toast.success(
+                `Indexed ${p.total} file(s) (${p.total_chunks} chunks).`,
+              )
+            } else {
+              toast.warning(
+                `Indexed ${p.succeeded}/${p.total} files. Some failed.`,
+              )
+            }
           }
         }
 
@@ -143,7 +166,9 @@ export function useDocuments() {
         }
         flush()
       } catch (err) {
-        setUploadError(err instanceof Error ? err.message : String(err))
+        const msg = err instanceof Error ? err.message : String(err)
+        setUploadError(msg)
+        toast.error(`Upload failed: ${msg}`)
       } finally {
         setUploading(false)
         // refresh the list so newly indexed files show up immediately
