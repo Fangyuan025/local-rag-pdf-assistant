@@ -54,10 +54,9 @@ app = FastAPI(
     description=(
         "Local-only HTTP API for the Hushdoc PDF assistant. Wraps the "
         "ingest / vector-store / RAG-chain modules behind a small set of "
-        "JSON + SSE endpoints so the React frontend can drive them without "
-        "running Streamlit."
+        "JSON + SSE endpoints. Consumed by the React frontend in ``web/``."
     ),
-    version="0.5.0",
+    version="1.0.0",
 )
 
 # CORS — Vite dev server on :5173 needs to call us on :8000. Production

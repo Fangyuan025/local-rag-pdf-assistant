@@ -71,7 +71,8 @@ def _load_tts():
 # Public API
 # ---------------------------------------------------------------------------
 def transcribe(audio_bytes: bytes) -> str:
-    """Convert recorded WAV bytes (e.g. from ``st.audio_input``) to text.
+    """Convert recorded WAV bytes (e.g. from the browser's MediaRecorder
+    after re-encoding to PCM WAV) to text.
 
     Whisper-base.en is English-only; non-English speech will be force-
     decoded as nonsense English. The UI surfaces this constraint via

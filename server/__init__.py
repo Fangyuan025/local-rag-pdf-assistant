@@ -3,9 +3,8 @@
 Run in dev with:
     uvicorn server.main:app --reload --port 8000
 
-The Streamlit ``app.py`` is kept untouched during the React-frontend
-migration; both UIs can run side by side until ``app.py`` is removed
-in the final cleanup commit.
+Pairs with the React frontend in ``web/`` (Vite dev server on :5173,
+which proxies /api/* to this backend).
 """
 import os
 

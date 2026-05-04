@@ -20,3 +20,10 @@ venv/
 # Runtime logs
 *.log
 
+# Frontend build artefacts (web/.gitignore also covers these, but be
+# explicit so a stray git-add at the repo root doesn't slip them in).
+web/node_modules/
+web/dist/
+web/.vite/
+web/*.log
+
